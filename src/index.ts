@@ -15,32 +15,50 @@ const app = express();
 const upload = multer({ storage: multer.memoryStorage() });
 const budgetBot = new BudgetBot();
 
-// Health check endpoint
+// Helth checkエンドポイント
 app.get('/health', (req, res) => {
+  console.log('🔍 Health check accessed at:', new Date().toISOString());
   res.json({ status: 'OK', timestamp: new Date().toISOString() });
 });
 
 // Webhookエンドポイント
 app.post('/webhook', line.middleware(config), (req: express.Request, res: express.Response) => {
+  console.log('🎯 Webhook received:', {
+    timestamp: new Date().toISOString(),
+    events: req.body.events?.length || 0,
+    body: JSON.stringify(req.body, null, 2)
+  });
+  
   Promise
     .all(req.body.events.map(handleEvent))
-    .then((result) => res.json(result))
+    .then((result) => {
+      console.log('✅ Webhook processed successfully:', result.length, 'events');
+      res.json(result);
+    })
     .catch((err) => {
-      console.error('Webhook Error:', err);
+      console.error('❌ Webhook Error:', err);
       res.status(500).end();
     });
 });
 
 // イベント処理
 async function handleEvent(event: line.WebhookEvent): Promise<void> {
+  console.log('📨 Processing event:', {
+    type: event.type,
+    timestamp: event.timestamp,
+    source: event.source
+  });
+
   if (event.type !== 'message') {
+    console.log('⏩ Skipping non-message event:', event.type);
     return;
   }
 
   try {
     await budgetBot.handleMessage(event);
+    console.log('✅ Message handled successfully');
   } catch (error) {
-    console.error('Event handling error:', error);
+    console.error('❌ Event handling error:', error);
   }
 }
 

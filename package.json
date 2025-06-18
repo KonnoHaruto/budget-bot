@@ -12,7 +12,10 @@
     "db:migrate": "prisma migrate dev",
     "db:generate": "prisma generate",
     "db:studio": "prisma studio",
-    "db:reset": "prisma migrate reset"
+    "db:reset": "prisma migrate reset",
+    "ngrok": "ngrok start --config ngrok.yml line-bot",
+    "dev:ngrok": "npm run build && concurrently \"npm start\" \"npm run ngrok\"",
+    "test:webhook": "curl -X GET http://localhost:3000/health"
   },
   "keywords": [
     "line",
@@ -38,6 +41,7 @@
   "devDependencies": {
     "@types/express": "^5.0.3",
     "@types/node": "^24.0.3",
+    "concurrently": "^8.2.2",
     "nodemon": "^3.1.10",
     "ts-node": "^10.9.2",
     "typescript": "^5.8.3"
