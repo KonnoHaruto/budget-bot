@@ -4,19 +4,36 @@
   "description": "LINE Bot for budget management with receipt scanning",
   "main": "dist/index.js",
   "scripts": {
-    "build": "tsc",
+    "build": "prisma generate && tsc",
     "start": "node dist/index.js",
     "dev": "nodemon --exec ts-node src/index.ts",
     "watch": "tsc -w",
-    "clean": "rm -rf dist"
+    "clean": "rm -rf dist",
+    "db:migrate": "prisma migrate dev",
+    "db:generate": "prisma generate",
+    "db:studio": "prisma studio",
+    "db:reset": "prisma migrate reset"
   },
-  "keywords": ["line", "bot", "budget", "typescript"],
+  "keywords": [
+    "line",
+    "bot",
+    "budget",
+    "typescript"
+  ],
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@google-cloud/vision": "^5.2.0",
     "@line/bot-sdk": "^10.0.0",
+    "@prisma/client": "^6.10.0",
+    "@types/multer": "^1.4.13",
+    "@types/pg": "^8.15.4",
     "dotenv": "^16.5.0",
-    "express": "^5.1.0"
+    "express": "^5.1.0",
+    "multer": "^2.0.1",
+    "pg": "^8.16.0",
+    "prisma": "^6.10.0",
+    "sharp": "^0.34.2"
   },
   "devDependencies": {
     "@types/express": "^5.0.3",
