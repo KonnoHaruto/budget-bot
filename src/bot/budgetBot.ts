@@ -2,6 +2,7 @@ import * as line from '@line/bot-sdk';
 import { databaseService } from '../database/prisma';
 import { ocrService } from '../services/ocrService';
 import { CurrencyService, ParsedAmount } from '../services/currencyService';
+import { chartService, ChartData } from '../services/chartService';
 import { PrismaClient } from '@prisma/client';
 
 type Transaction = {
@@ -103,6 +104,8 @@ export class BudgetBot {
         const transactionId = data.replace('confirm_delete_', '');
         await this.handleTransactionDeleteConfirm(replyToken, userId, transactionId);
       }
+    } else if (data === 'receipt_edit') {
+      await this.handleReceiptEdit(replyToken, userId);
     }
   }
 
@@ -277,32 +280,18 @@ export class BudgetBot {
 
   private async handleBudgetStatus(replyToken: string, userId: string): Promise<void> {
     try {
+      // ローディングアニメーション表示
+      await this.showLoadingAnimation(userId);
+      
       const stats = await databaseService.getUserStats(userId);
       if (!stats) {
         await this.replyMessage(replyToken, '❌ ユーザー情報が見つかりません。');
         return;
       }
 
-      // Flex Messageでプログレスカードを送信
+      // 進捗カードを送信
       const flexContent = await this.createBudgetProgressCard(stats, userId);
-      await this.replyFlexMessage(replyToken, '予算状況', flexContent);
-
-      // 詳細情報をクイックリプライ付きメッセージで送信
-      const statusEmoji = stats.budgetUsagePercentage > 100 ? '🚨' : 
-                         stats.budgetUsagePercentage > 80 ? '⚠️' : '✅';
-
-      const detailMessage = `${statusEmoji} 詳細情報\n\n` +
-        `💰 月間予算: ${stats.monthlyBudget.toLocaleString()}円\n` +
-        `💸 使用済み: ${stats.currentSpent.toLocaleString()}円\n` +
-        `💵 残り予算: ${stats.remainingBudget.toLocaleString()}円`;
-
-      const quickReplyItems = [
-        { label: '📝 履歴確認', text: '履歴' },
-        { label: '💰 予算変更', text: '予算設定' },
-        { label: '🔄 リセット', text: 'リセット' }
-      ];
-
-      await this.pushMessageWithQuickReply(userId, detailMessage, quickReplyItems);
+      await this.replyFlexMessage(replyToken, '📊 予算進捗状況', flexContent);
     } catch (error) {
       console.error('Budget status error:', error);
       await this.replyMessage(replyToken, '❌ 予算状況の取得中にエラーが発生しました。');
@@ -570,13 +559,6 @@ export class BudgetBot {
     return 0;
   }
 
-  private createProgressBar(percentage: number): string {
-    const bars = 10;
-    const filled = Math.round((percentage / 100) * bars);
-    const empty = bars - filled;
-    
-    return '█'.repeat(Math.min(filled, bars)) + '░'.repeat(Math.max(empty, 0));
-  }
 
   private async getBudgetPeriodStats(monthlyBudget: number, currentSpent: number, userId: string): Promise<{
     daily: { budget: number; spent: number; percentage: number; remaining: number; todaySpent: number };
@@ -652,14 +634,270 @@ export class BudgetBot {
     return '●'.repeat(filledDots) + '○'.repeat(emptyDots);
   }
 
+  private createProgressBar(percentage: number, color: string): any {
+    const filledWidth = Math.max(1, Math.min(Math.round(percentage), 100));
+    const remainingWidth = Math.max(1, 100 - filledWidth);
+    
+    return {
+      type: 'box',
+      layout: 'horizontal',
+      contents: [
+        ...(filledWidth > 0 ? [{
+          type: 'box',
+          layout: 'vertical',
+          contents: [],
+          backgroundColor: color,
+          cornerRadius: '10px',
+          flex: filledWidth
+        }] : []),
+        ...(remainingWidth > 0 ? [{
+          type: 'box',
+          layout: 'vertical',
+          contents: [],
+          backgroundColor: '#E8E8E8',
+          cornerRadius: '10px',
+          flex: remainingWidth
+        }] : [])
+      ],
+      height: '8px',
+      margin: 'md'
+    };
+  }
+
+  private createReceiptConfirmationCard(
+    amount: number, 
+    originalAmount?: number, 
+    currency?: string, 
+    rate?: number, 
+    storeName?: string
+  ): any {
+    const displayAmount = originalAmount || amount;
+    const displayCurrency = currency || 'JPY';
+    const isForeignCurrency = currency && currency !== 'JPY';
+    
+    // ボディーのコンテンツを構築
+    const bodyContents: any[] = [];
+    
+    if (isForeignCurrency) {
+      // 外貨の場合：日本円換算額とレートを表示
+      bodyContents.push(
+        {
+          type: 'box',
+          layout: 'baseline',
+          spacing: 'sm',
+          contents: [
+            {
+              type: 'text',
+              text: '日本円',
+              color: '#aaaaaa',
+              size: 'sm',
+              flex: 2
+            },
+            {
+              type: 'text',
+              text: `¥${amount.toLocaleString()}`,
+              wrap: true,
+              color: '#06C755',
+              size: 'md',
+              flex: 3,
+              weight: 'bold'
+            }
+          ]
+        },
+        {
+          type: 'box',
+          layout: 'baseline',
+          spacing: 'sm',
+          contents: [
+            {
+              type: 'text',
+              text: 'レート',
+              color: '#aaaaaa',
+              size: 'sm',
+              flex: 2
+            },
+            {
+              type: 'text',
+              text: rate ? `1 ${currency} = ${rate.toFixed(4)} JPY` : '取得中...',
+              wrap: true,
+              color: '#666666',
+              size: 'sm',
+              flex: 3
+            }
+          ]
+        }
+      );
+    }
+    
+    if (storeName) {
+      bodyContents.push({
+        type: 'box',
+        layout: 'baseline',
+        spacing: 'sm',
+        contents: [
+          {
+            type: 'text',
+            text: '店舗名',
+            color: '#aaaaaa',
+            size: 'sm',
+            flex: 2
+          },
+          {
+            type: 'text',
+            text: storeName,
+            wrap: true,
+            color: '#666666',
+            size: 'sm',
+            flex: 3,
+            weight: 'bold'
+          }
+        ]
+      });
+    }
+    
+    // 日本円の場合で店舗名がない場合の説明テキスト
+    if (!isForeignCurrency && !storeName) {
+      bodyContents.push({
+        type: 'text',
+        text: 'この支出を記録しますか？',
+        color: '#666666',
+        size: 'sm',
+        align: 'center'
+      });
+    }
+
+    return {
+      type: 'bubble',
+      size: 'kilo',
+      header: {
+        type: 'box',
+        layout: 'vertical',
+        contents: [
+          {
+            type: 'text',
+            text: '💰 支出確認',
+            weight: 'bold',
+            color: '#ffffff',
+            size: 'lg',
+            align: 'center'
+          },
+          {
+            type: 'text',
+            text: `${originalAmount ? originalAmount.toLocaleString() : amount.toLocaleString()} ${displayCurrency}`,
+            weight: 'bold',
+            color: '#ffffff',
+            size: 'xl',
+            align: 'center'
+          },
+          {
+            type: 'text',
+            text: originalAmount ? '元の金額' : '金額',
+            color: '#ffffff',
+            size: 'xs',
+            align: 'center'
+          }
+        ],
+        backgroundColor: '#06C755',
+        paddingAll: 'lg'
+      },
+      body: {
+        type: 'box',
+        layout: 'vertical',
+        contents: bodyContents,
+        paddingAll: 'lg'
+      },
+      footer: {
+        type: 'box',
+        layout: 'vertical',
+        spacing: 'sm',
+        contents: [
+          {
+            type: 'button',
+            style: 'primary',
+            height: 'sm',
+            color: '#06C755',
+            action: {
+              type: 'postback',
+              label: '✅ 記録する',
+              data: 'confirm_yes'
+            }
+          },
+          {
+            type: 'box',
+            layout: 'horizontal',
+            spacing: 'sm',
+            contents: [
+              {
+                type: 'button',
+                style: 'secondary',
+                height: 'sm',
+                flex: 1,
+                action: {
+                  type: 'postback',
+                  label: '✏️ 編集',
+                  data: 'receipt_edit'
+                }
+              },
+              {
+                type: 'button',
+                style: 'secondary',
+                height: 'sm',
+                flex: 1,
+                action: {
+                  type: 'postback',
+                  label: '❌ キャンセル',
+                  data: 'confirm_no'
+                }
+              }
+            ]
+          }
+        ],
+        paddingAll: 'lg'
+      }
+    };
+  }
+
   private async createBudgetProgressCard(stats: any, userId: string): Promise<any> {
     const periodStats = await this.getBudgetPeriodStats(stats.monthlyBudget, stats.currentSpent, userId);
     
+    // ChartDataの作成
+    const dailyChartData: ChartData = {
+      spent: periodStats.daily.todaySpent,
+      remaining: Math.max(0, periodStats.daily.remaining),
+      budget: periodStats.daily.budget,
+      percentage: periodStats.daily.percentage,
+      type: 'daily',
+      period: '本日'
+    };
+
+    const weeklyChartData: ChartData = {
+      spent: periodStats.weekly.spent,
+      remaining: Math.max(0, periodStats.weekly.remaining),
+      budget: periodStats.weekly.budget,
+      percentage: periodStats.weekly.percentage,
+      type: 'weekly',
+      period: '今週'
+    };
+
+    const monthlyChartData: ChartData = {
+      spent: periodStats.monthly.spent,
+      remaining: Math.max(0, periodStats.monthly.remaining),
+      budget: periodStats.monthly.budget,
+      percentage: periodStats.monthly.percentage,
+      type: 'monthly',
+      period: '今月'
+    };
+
+    // プログレスデータの生成
+    const dailyProgressData = chartService.generateProgressData(dailyChartData);
+    const weeklyProgressData = chartService.generateProgressData(weeklyChartData);
+    const monthlyProgressData = chartService.generateProgressData(monthlyChartData);
+
     // ステータスと色を決定
     const getStatusAndColor = (percentage: number) => {
-      if (percentage <= 50) return { status: 'Good', color: '#06C755' };
-      if (percentage <= 80) return { status: 'Warning', color: '#FF9500' };
-      return { status: 'Over Budget', color: '#FF334B' };
+      if (percentage <= 50) return { status: 'Good', color: '#4CAF50' };
+      if (percentage <= 80) return { status: 'Warning', color: '#FF9800' };
+      return { status: 'Over Budget', color: '#F44336' };
     };
 
     const dailyStatus = getStatusAndColor(periodStats.daily.percentage);
@@ -681,7 +919,7 @@ export class BudgetBot {
                 text: 'Daily',
                 weight: 'bold',
                 color: '#ffffff',
-                size: 'md',
+                size: 'lg',
                 align: 'center'
               },
               {
@@ -700,64 +938,93 @@ export class BudgetBot {
                 align: 'center'
               }
             ],
-            backgroundColor: dailyStatus.color,
-            paddingTop: 'lg',
-            paddingBottom: 'lg',
-            paddingStart: 'md',
-            paddingEnd: 'md'
+            backgroundColor: '#06C755',
+            paddingAll: 'lg'
           },
           body: {
             type: 'box',
             layout: 'vertical',
             contents: [
+              this.createProgressBar(dailyProgressData.percentage, dailyProgressData.color),
               {
-                type: 'text',
-                text: this.createProgressIndicator(periodStats.daily.percentage),
-                size: 'lg',
-                color: '#666666',
-                align: 'center',
-                margin: 'md'
+                type: 'box',
+                layout: 'horizontal',
+                contents: [
+                  {
+                    type: 'text',
+                    text: `${dailyProgressData.percentage.toFixed(1)}%`,
+                    color: dailyProgressData.color,
+                    weight: 'bold',
+                    size: 'sm',
+                    flex: 0
+                  },
+                  {
+                    type: 'text',
+                    text: dailyProgressData.status,
+                    color: '#666666',
+                    size: 'xs',
+                    align: 'end',
+                    flex: 1
+                  }
+                ],
+                margin: 'sm'
               },
               {
                 type: 'box',
                 layout: 'vertical',
+                spacing: 'sm',
                 margin: 'lg',
-                spacing: 'md',
                 contents: [
                   {
-                    type: 'text',
-                    text: '今日の支出',
-                    color: '#aaaaaa',
-                    size: 'sm'
+                    type: 'box',
+                    layout: 'baseline',
+                    spacing: 'sm',
+                    contents: [
+                      {
+                        type: 'text',
+                        text: '今日の支出',
+                        color: '#aaaaaa',
+                        size: 'sm',
+                        flex: 2
+                      },
+                      {
+                        type: 'text',
+                        text: `¥${periodStats.daily.todaySpent.toLocaleString()}`,
+                        wrap: true,
+                        color: '#666666',
+                        size: 'sm',
+                        flex: 3,
+                        weight: 'bold'
+                      }
+                    ]
                   },
                   {
-                    type: 'text',
-                    text: `¥${periodStats.daily.todaySpent.toLocaleString()}`,
-                    color: '#666666',
-                    size: 'md',
-                    weight: 'bold'
-                  },
-                  {
-                    type: 'text',
-                    text: '1日あたりの予算',
-                    color: '#aaaaaa',
-                    size: 'sm',
-                    margin: 'md'
-                  },
-                  {
-                    type: 'text',
-                    text: `¥${periodStats.daily.budget.toLocaleString()}`,
-                    color: '#666666',
-                    size: 'md',
-                    weight: 'bold'
+                    type: 'box',
+                    layout: 'baseline',
+                    spacing: 'sm',
+                    contents: [
+                      {
+                        type: 'text',
+                        text: '残り予算',
+                        color: '#aaaaaa',
+                        size: 'sm',
+                        flex: 2
+                      },
+                      {
+                        type: 'text',
+                        text: `¥${Math.max(0, periodStats.daily.remaining).toLocaleString()}`,
+                        wrap: true,
+                        color: '#06C755',
+                        size: 'sm',
+                        flex: 3,
+                        weight: 'bold'
+                      }
+                    ]
                   }
                 ]
               }
             ],
-            paddingTop: 'lg',
-            paddingBottom: 'lg',
-            paddingStart: 'lg',
-            paddingEnd: 'lg'
+            paddingAll: 'lg'
           }
         },
         {
@@ -772,7 +1039,7 @@ export class BudgetBot {
                 text: 'Weekly',
                 weight: 'bold',
                 color: '#ffffff',
-                size: 'md',
+                size: 'lg',
                 align: 'center'
               },
               {
@@ -791,64 +1058,93 @@ export class BudgetBot {
                 align: 'center'
               }
             ],
-            backgroundColor: weeklyStatus.color,
-            paddingTop: 'lg',
-            paddingBottom: 'lg',
-            paddingStart: 'md',
-            paddingEnd: 'md'
+            backgroundColor: '#06C755',
+            paddingAll: 'lg'
           },
           body: {
             type: 'box',
             layout: 'vertical',
             contents: [
+              this.createProgressBar(weeklyProgressData.percentage, weeklyProgressData.color),
               {
-                type: 'text',
-                text: this.createProgressIndicator(periodStats.weekly.percentage),
-                size: 'lg',
-                color: '#666666',
-                align: 'center',
-                margin: 'md'
+                type: 'box',
+                layout: 'horizontal',
+                contents: [
+                  {
+                    type: 'text',
+                    text: `${weeklyProgressData.percentage.toFixed(1)}%`,
+                    color: weeklyProgressData.color,
+                    weight: 'bold',
+                    size: 'sm',
+                    flex: 0
+                  },
+                  {
+                    type: 'text',
+                    text: weeklyProgressData.status,
+                    color: '#666666',
+                    size: 'xs',
+                    align: 'end',
+                    flex: 1
+                  }
+                ],
+                margin: 'sm'
               },
               {
                 type: 'box',
                 layout: 'vertical',
+                spacing: 'sm',
                 margin: 'lg',
-                spacing: 'md',
                 contents: [
                   {
-                    type: 'text',
-                    text: '今週の支出',
-                    color: '#aaaaaa',
-                    size: 'sm'
+                    type: 'box',
+                    layout: 'baseline',
+                    spacing: 'sm',
+                    contents: [
+                      {
+                        type: 'text',
+                        text: '今週の支出',
+                        color: '#aaaaaa',
+                        size: 'sm',
+                        flex: 2
+                      },
+                      {
+                        type: 'text',
+                        text: `¥${periodStats.weekly.spent.toLocaleString()}`,
+                        wrap: true,
+                        color: '#666666',
+                        size: 'sm',
+                        flex: 3,
+                        weight: 'bold'
+                      }
+                    ]
                   },
                   {
-                    type: 'text',
-                    text: `¥${periodStats.weekly.spent.toLocaleString()}`,
-                    color: '#666666',
-                    size: 'md',
-                    weight: 'bold'
-                  },
-                  {
-                    type: 'text',
-                    text: '今週の予算',
-                    color: '#aaaaaa',
-                    size: 'sm',
-                    margin: 'md'
-                  },
-                  {
-                    type: 'text',
-                    text: `¥${periodStats.weekly.budget.toLocaleString()}`,
-                    color: '#666666',
-                    size: 'md',
-                    weight: 'bold'
+                    type: 'box',
+                    layout: 'baseline',
+                    spacing: 'sm',
+                    contents: [
+                      {
+                        type: 'text',
+                        text: '残り予算',
+                        color: '#aaaaaa',
+                        size: 'sm',
+                        flex: 2
+                      },
+                      {
+                        type: 'text',
+                        text: `¥${Math.max(0, periodStats.weekly.remaining).toLocaleString()}`,
+                        wrap: true,
+                        color: '#06C755',
+                        size: 'sm',
+                        flex: 3,
+                        weight: 'bold'
+                      }
+                    ]
                   }
                 ]
               }
             ],
-            paddingTop: 'lg',
-            paddingBottom: 'lg',
-            paddingStart: 'lg',
-            paddingEnd: 'lg'
+            paddingAll: 'lg'
           }
         },
         {
@@ -863,7 +1159,7 @@ export class BudgetBot {
                 text: 'Monthly',
                 weight: 'bold',
                 color: '#ffffff',
-                size: 'md',
+                size: 'lg',
                 align: 'center'
               },
               {
@@ -882,68 +1178,237 @@ export class BudgetBot {
                 align: 'center'
               }
             ],
-            backgroundColor: monthlyStatus.color,
-            paddingTop: 'lg',
-            paddingBottom: 'lg',
-            paddingStart: 'md',
-            paddingEnd: 'md'
+            backgroundColor: '#06C755',
+            paddingAll: 'lg'
           },
           body: {
             type: 'box',
             layout: 'vertical',
             contents: [
+              this.createProgressBar(monthlyProgressData.percentage, monthlyProgressData.color),
               {
-                type: 'text',
-                text: this.createProgressIndicator(periodStats.monthly.percentage),
-                size: 'lg',
-                color: '#666666',
-                align: 'center',
-                margin: 'md'
+                type: 'box',
+                layout: 'horizontal',
+                contents: [
+                  {
+                    type: 'text',
+                    text: `${monthlyProgressData.percentage.toFixed(1)}%`,
+                    color: monthlyProgressData.color,
+                    weight: 'bold',
+                    size: 'sm',
+                    flex: 0
+                  },
+                  {
+                    type: 'text',
+                    text: monthlyProgressData.status,
+                    color: '#666666',
+                    size: 'xs',
+                    align: 'end',
+                    flex: 1
+                  }
+                ],
+                margin: 'sm'
               },
               {
                 type: 'box',
                 layout: 'vertical',
+                spacing: 'sm',
                 margin: 'lg',
-                spacing: 'md',
                 contents: [
                   {
-                    type: 'text',
-                    text: '今月の支出',
-                    color: '#aaaaaa',
-                    size: 'sm'
+                    type: 'box',
+                    layout: 'baseline',
+                    spacing: 'sm',
+                    contents: [
+                      {
+                        type: 'text',
+                        text: '今月の支出',
+                        color: '#aaaaaa',
+                        size: 'sm',
+                        flex: 2
+                      },
+                      {
+                        type: 'text',
+                        text: `¥${periodStats.monthly.spent.toLocaleString()}`,
+                        wrap: true,
+                        color: '#666666',
+                        size: 'sm',
+                        flex: 3,
+                        weight: 'bold'
+                      }
+                    ]
                   },
                   {
-                    type: 'text',
-                    text: `¥${periodStats.monthly.spent.toLocaleString()}`,
-                    color: '#666666',
-                    size: 'md',
-                    weight: 'bold'
-                  },
-                  {
-                    type: 'text',
-                    text: '月間予算',
-                    color: '#aaaaaa',
-                    size: 'sm',
-                    margin: 'md'
-                  },
-                  {
-                    type: 'text',
-                    text: `¥${periodStats.monthly.budget.toLocaleString()}`,
-                    color: '#666666',
-                    size: 'md',
-                    weight: 'bold'
+                    type: 'box',
+                    layout: 'baseline',
+                    spacing: 'sm',
+                    contents: [
+                      {
+                        type: 'text',
+                        text: '残り予算',
+                        color: '#aaaaaa',
+                        size: 'sm',
+                        flex: 2
+                      },
+                      {
+                        type: 'text',
+                        text: `¥${Math.max(0, periodStats.monthly.remaining).toLocaleString()}`,
+                        wrap: true,
+                        color: '#06C755',
+                        size: 'sm',
+                        flex: 3,
+                        weight: 'bold'
+                      }
+                    ]
                   }
                 ]
               }
             ],
-            paddingTop: 'lg',
-            paddingBottom: 'lg',
-            paddingStart: 'lg',
-            paddingEnd: 'lg'
+            paddingAll: 'lg'
           }
         }
       ]
     };
+  }
+
+  async createWeeklyTrendCard(userId: string): Promise<any> {
+    try {
+      // 過去7日間のデータを取得
+      const weeklyData = [];
+      const today = new Date();
+      
+      for (let i = 6; i >= 0; i--) {
+        const date = new Date(today);
+        date.setDate(date.getDate() - i);
+        date.setHours(0, 0, 0, 0);
+        
+        const endDate = new Date(date);
+        endDate.setHours(23, 59, 59, 999);
+        
+        // その日の支出を取得（簡易版）
+        const daySpent = await this.getDaySpent(userId, date);
+        const dayName = date.toLocaleDateString('ja-JP', { weekday: 'short' });
+        
+        weeklyData.push({
+          day: dayName,
+          spent: daySpent
+        });
+      }
+
+      const trendChartUrl = chartService.generateWeeklyTrendChart(weeklyData);
+      const totalWeekSpent = weeklyData.reduce((sum: number, day: { day: string; spent: number }) => sum + day.spent, 0);
+      
+      return {
+        type: 'bubble',
+        size: 'giga',
+        header: {
+          type: 'box',
+          layout: 'vertical',
+          contents: [
+            {
+              type: 'text',
+              text: '📈 Weekly Spending Trend',
+              weight: 'bold',
+              color: '#ffffff',
+              size: 'lg',
+              align: 'center'
+            },
+            {
+              type: 'text',
+              text: `Total: ¥${totalWeekSpent.toLocaleString()}`,
+              color: '#ffffff',
+              size: 'md',
+              align: 'center',
+              margin: 'sm'
+            }
+          ],
+          backgroundColor: '#2196F3',
+          paddingAll: 'lg'
+        },
+        body: {
+          type: 'box',
+          layout: 'vertical',
+          contents: [
+            {
+              type: 'image',
+              url: trendChartUrl,
+              size: 'full',
+              aspectRatio: '2:1',
+              aspectMode: 'cover',
+              margin: 'md'
+            },
+            {
+              type: 'box',
+              layout: 'vertical',
+              spacing: 'md',
+              margin: 'lg',
+              contents: [
+                {
+                  type: 'text',
+                  text: '🔍 支出パターンの分析',
+                  weight: 'bold',
+                  color: '#333333',
+                  size: 'md'
+                },
+                {
+                  type: 'text',
+                  text: this.analyzeTrend(weeklyData),
+                  color: '#666666',
+                  size: 'sm',
+                  wrap: true
+                }
+              ]
+            }
+          ],
+          paddingAll: 'lg'
+        }
+      };
+    } catch (error) {
+      console.error('Weekly trend card error:', error);
+      return null;
+    }
+  }
+
+  private async getDaySpent(userId: string, date: Date): Promise<number> {
+    try {
+      const startOfDay = new Date(date);
+      startOfDay.setHours(0, 0, 0, 0);
+      
+      const endOfDay = new Date(date);
+      endOfDay.setHours(23, 59, 59, 999);
+      
+      const user = await databaseService.getUser(userId);
+      if (!user) return 0;
+
+      // 簡易版：その日の取引を合計. 今後より詳細に
+      const transactions = await databaseService.getRecentTransactions(userId, 100);
+      return transactions
+        .filter((t: Transaction) => {
+          const transactionDate = new Date(t.createdAt);
+          return transactionDate >= startOfDay && transactionDate <= endOfDay;
+        })
+        .reduce((sum: number, t: Transaction) => sum + t.amount, 0);
+    } catch (error) {
+      console.error('Get day spent error:', error);
+      return 0;
+    }
+  }
+
+  private analyzeTrend(weeklyData: { day: string; spent: number }[]): string {
+    const amounts = weeklyData.map((d: { day: string; spent: number }) => d.spent);
+    const maxAmount = Math.max(...amounts);
+    const maxDay = weeklyData.find((d: { day: string; spent: number }) => d.spent === maxAmount)?.day || '';
+    const avgAmount = amounts.reduce((sum: number, amount: number) => sum + amount, 0) / amounts.length;
+    
+    let analysis = `今週の最高支出は${maxDay}の¥${maxAmount.toLocaleString()}でした。`;
+    
+    if (maxAmount > avgAmount * 1.5) {
+      analysis += ' 支出にばらつきがあります。';
+    } else {
+      analysis += ' 比較的安定した支出パターンです。';
+    }
+    
+    return analysis;
   }
 
   private async replyMessage(replyToken: string, text: string): Promise<void> {
@@ -960,7 +1425,7 @@ export class BudgetBot {
     }
   }
 
-  private async pushMessage(userId: string, text: string): Promise<void> {
+  async pushMessage(userId: string, text: string): Promise<void> {
     try {
       await this.client.pushMessage({
         to: userId,
@@ -1002,7 +1467,7 @@ export class BudgetBot {
     }
   }
 
-  private async pushMessageWithQuickReply(
+  async pushMessageWithQuickReply(
     userId: string, 
     text: string, 
     quickReplyItems: { label: string; text: string }[]
@@ -1045,7 +1510,7 @@ export class BudgetBot {
     }
   }
 
-  private async pushFlexMessage(userId: string, altText: string, flexContent: any): Promise<void> {
+  async pushFlexMessage(userId: string, altText: string, flexContent: any): Promise<void> {
     try {
       await this.client.pushMessage({
         to: userId,
@@ -1057,6 +1522,17 @@ export class BudgetBot {
       });
     } catch (error) {
       console.error('Push flex message error:', error);
+    }
+  }
+
+  async showLoadingAnimation(userId: string): Promise<void> {
+    try {
+      await this.client.showLoadingAnimation({
+        chatId: userId,
+        loadingSeconds: 3
+      });
+    } catch (error) {
+      console.error('Show loading animation error:', error);
     }
   }
 
@@ -1124,24 +1600,6 @@ export class BudgetBot {
       // 変換後の金額を追加
       mainAmount.convertedAmount = conversionResult.convertedAmount;
       
-      // 詳細情報を先に送信
-      let detailText = '';
-      if (mainAmount.currency.code === 'JPY') {
-        detailText = `💰 金額: ${mainAmount.amount.toLocaleString()}円`;
-      } else {
-        detailText = `💰 元の金額: ${mainAmount.amount.toLocaleString()} ${mainAmount.currency.code}\n`;
-        detailText += `💱 日本円: ${conversionResult.convertedAmount.toLocaleString()}円\n`;
-        detailText += `📊 レート: 1 ${mainAmount.currency.code} = ${conversionResult.rate.toFixed(4)} JPY\n`;
-        detailText += `${conversionResult.isRealTime ? '🔄 リアルタイムレート' : '⚠️ 固定レート'}`;
-      }
-      
-      if (storeName) {
-        detailText += `\n🏪 店舗: ${storeName}`;
-      }
-      
-      // 詳細情報を送信
-      await this.pushMessage(userId, detailText);
-      
       // 保留中取引として保存
       this.pendingTransactions.set(userId, {
         userId,
@@ -1151,13 +1609,17 @@ export class BudgetBot {
       });
       console.log('💾 Pending transaction saved');
       
-      // 確認用の簡潔なメッセージでButtonsテンプレートを送信
-      const confirmText = '📋 この支出を記録しますか？';
-      console.log('📤 About to send buttons message...');
-      await this.pushButtonsMessage(userId, '支出確認', confirmText, [
-        { label: '✅ 記録する', data: 'confirm_yes' },
-        { label: '❌ キャンセル', data: 'confirm_no' }
-      ]);
+      // Flex Messageで確認画面を送信
+      const confirmationCard = this.createReceiptConfirmationCard(
+        conversionResult.convertedAmount,
+        mainAmount.currency.code !== 'JPY' ? mainAmount.amount : undefined,
+        mainAmount.currency.code !== 'JPY' ? mainAmount.currency.code : undefined,
+        mainAmount.currency.code !== 'JPY' ? conversionResult.rate : undefined,
+        storeName || undefined
+      );
+      
+      console.log('📤 About to send confirmation flex message...');
+      await this.pushFlexMessage(userId, '💰 支出確認', confirmationCard);
       
     } catch (error) {
       console.error('❌ Process receipt amounts error:', error);
@@ -1191,6 +1653,79 @@ export class BudgetBot {
       await this.addExpense(replyToken, userId, jpyAmount, description);
     } else {
       await this.replyMessage(replyToken, '❌ 支出の記録をキャンセルしました。');
+    }
+  }
+
+  private async handleReceiptEdit(replyToken: string, userId: string): Promise<void> {
+    const pending = this.pendingTransactions.get(userId);
+    
+    if (!pending) {
+      await this.replyMessage(replyToken, '⚠️ 編集可能な取引がありません。');
+      return;
+    }
+    
+    const mainAmount = pending.parsedAmounts[0];
+    const currentAmount = mainAmount.convertedAmount || mainAmount.amount;
+    
+    await this.replyMessage(
+      replyToken, 
+      `✏️ 金額を編集してください\n\n` +
+      `現在の金額: ¥${currentAmount.toLocaleString()}\n` +
+      `新しい金額を数字で入力してください。`
+    );
+    
+    // 編集モードのフラグを設定（簡易実装）
+    this.pendingEdits.set(userId, {
+      userId,
+      transactionId: -1, // レシート編集の場合は特別な値
+      timestamp: Date.now()
+    });
+  }
+
+  private async handleReceiptAmountEdit(replyToken: string, userId: string, newAmount: number): Promise<void> {
+    const pending = this.pendingTransactions.get(userId);
+    
+    if (!pending) {
+      await this.replyMessage(replyToken, '⚠️ 編集可能な取引がありません。');
+      return;
+    }
+    
+    try {
+      const mainAmount = pending.parsedAmounts[0];
+      const originalCurrency = mainAmount.currency.code;
+      
+      // 元の通貨として金額を更新
+      mainAmount.amount = newAmount;
+      
+      let convertedAmount = newAmount;
+      let rate: number | undefined = undefined;
+      
+      // 外貨の場合は日本円に換算
+      if (originalCurrency !== 'JPY') {
+        const conversionResult = await CurrencyService.convertToJPY(newAmount, originalCurrency);
+        convertedAmount = conversionResult.convertedAmount;
+        rate = conversionResult.rate;
+        mainAmount.convertedAmount = convertedAmount;
+        
+        await this.replyMessage(replyToken, `✅ 金額を ${newAmount.toLocaleString()} ${originalCurrency} (¥${convertedAmount.toLocaleString()}) に変更しました。`);
+      } else {
+        mainAmount.convertedAmount = newAmount;
+        await this.replyMessage(replyToken, `✅ 金額を ¥${newAmount.toLocaleString()} に変更しました。`);
+      }
+      
+      // 更新されたレシート確認カードを再送信
+      const confirmationCard = this.createReceiptConfirmationCard(
+        convertedAmount,
+        originalCurrency !== 'JPY' ? newAmount : undefined,
+        originalCurrency !== 'JPY' ? originalCurrency : undefined,
+        rate,
+        pending.storeName || undefined
+      );
+      
+      await this.pushFlexMessage(userId, '💰 支出確認（編集済み）', confirmationCard);
+    } catch (error) {
+      console.error('Receipt amount edit error:', error);
+      await this.replyMessage(replyToken, '❌ 金額の変更中にエラーが発生しました。');
     }
   }
 
@@ -1316,6 +1851,12 @@ export class BudgetBot {
 
   private async handleDirectEditAmount(replyToken: string, userId: string, transactionId: number, newAmount: number): Promise<void> {
     try {
+      // レシート編集の場合（transactionId = -1）
+      if (transactionId === -1) {
+        await this.handleReceiptAmountEdit(replyToken, userId, newAmount);
+        return;
+      }
+      
       const updatedTransaction = await databaseService.editTransaction(userId, transactionId, newAmount);
       
       const message = `✅ 取引を編集しました\n\n` +

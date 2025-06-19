@@ -1,5 +1,5 @@
 import { ImageAnnotatorClient } from '@google-cloud/vision';
-import sharp from 'sharp';
+const sharp = require('sharp');
 import { CurrencyService, ParsedAmount } from './currencyService';
 
 export class OCRService {
