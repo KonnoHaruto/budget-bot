@@ -61,6 +61,7 @@ ngrok.yml
 # .md file
 SETUP_OCR.md
 TEST_SCENARIOS.md
+todo.md
 
 # OCR JSON file
 Budget Baddy.json

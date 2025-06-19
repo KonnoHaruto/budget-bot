@@ -5,6 +5,7 @@ import 'dotenv/config';
 import { databaseService } from './database/prisma';
 import { ocrService } from './services/ocrService';
 import { BudgetBot } from './bot/budgetBot';
+import { SchedulerService } from './services/schedulerService';
 
 const config = {
   channelAccessToken: process.env.CHANNEL_ACCESS_TOKEN!,
@@ -14,11 +15,30 @@ const config = {
 const app = express();
 const upload = multer({ storage: multer.memoryStorage() });
 const budgetBot = new BudgetBot();
+const schedulerService = new SchedulerService(budgetBot);
 
-// Helth checkエンドポイント
+// Health checkエンドポイント
 app.get('/health', (req, res) => {
   console.log('🔍 Health check accessed at:', new Date().toISOString());
   res.json({ status: 'OK', timestamp: new Date().toISOString() });
+});
+
+// テスト用週間レポート送信エンドポイント（リリース時には忘れずに削除）
+app.post('/test-weekly-report', express.json(), (req: express.Request, res: express.Response) => {
+  const { userId } = req.body;
+  if (!userId) {
+    res.status(400).json({ error: 'userId is required' });
+    return;
+  }
+  
+  schedulerService.sendTestWeeklyReport(userId)
+    .then(() => {
+      res.json({ success: true, message: `Test weekly report sent to user: ${userId}` });
+    })
+    .catch((error) => {
+      console.error('Test weekly report error:', error);
+      res.status(500).json({ error: 'Failed to send test weekly report' });
+    });
 });
 
 // Webhookエンドポイント
@@ -74,4 +94,7 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 Budget Bot server running on port ${PORT}`);
   console.log(`📊 Health check: http://localhost:${PORT}/health`);
+  
+  // スケジューラーを開始
+  schedulerService.start();
 });

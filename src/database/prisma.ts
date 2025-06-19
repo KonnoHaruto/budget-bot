@@ -203,6 +203,16 @@ export class DatabaseService {
       budgetUsagePercentage
     };
   }
+
+  async getAllUsers(): Promise<{ lineUserId: string; monthlyBudget: number; currentSpent: number; }[]> {
+    return await prisma.user.findMany({
+      select: {
+        lineUserId: true,
+        monthlyBudget: true,
+        currentSpent: true
+      }
+    });
+  }
 }
 
 export const databaseService = new DatabaseService();
