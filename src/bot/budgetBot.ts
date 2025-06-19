@@ -4,7 +4,14 @@ import { ocrService } from '../services/ocrService';
 import { CurrencyService, ParsedAmount } from '../services/currencyService';
 import { PrismaClient } from '@prisma/client';
 
-type Transaction = NonNullable<Awaited<ReturnType<PrismaClient['transaction']['findFirst']>>>;
+type Transaction = {
+  id: number;
+  userId: string;
+  amount: number;
+  description: string | null;
+  imageUrl: string | null;
+  createdAt: Date;
+};
 
 interface PendingTransaction {
   userId: string;
@@ -13,10 +20,24 @@ interface PendingTransaction {
   timestamp: number;
 }
 
+interface PendingEdit {
+  userId: string;
+  transactionId: number;
+  timestamp: number;
+}
+
+interface PendingDelete {
+  userId: string;
+  transactionId: number;
+  timestamp: number;
+}
+
 export class BudgetBot {
   private client: line.messagingApi.MessagingApiClient;
   private blobClient: line.messagingApi.MessagingApiBlobClient;
   private pendingTransactions: Map<string, PendingTransaction> = new Map();
+  private pendingEdits: Map<string, PendingEdit> = new Map();
+  private pendingDeletes: Map<string, PendingDelete> = new Map();
 
   constructor() {
     const config = {
@@ -60,15 +81,64 @@ export class BudgetBot {
     const data = postback.data;
     
     if (data.startsWith('confirm_')) {
-      const confirmed = data === 'confirm_yes';
-      await this.handleConfirmation(replyToken, userId, confirmed);
+      if (data.startsWith('confirm_reset_')) {
+        const confirmed = data === 'confirm_reset_yes';
+        await this.handleResetConfirmation(replyToken, userId, confirmed);
+      } else {
+        const confirmed = data === 'confirm_yes';
+        await this.handleConfirmation(replyToken, userId, confirmed);
+      }
     } else if (data.startsWith('menu_')) {
       await this.handleMenuAction(replyToken, userId, data);
+    } else if (data.startsWith('edit_transaction_')) {
+      const transactionId = data.replace('edit_transaction_', '');
+      await this.handleTransactionEdit(replyToken, userId, transactionId);
+    } else if (data.startsWith('delete_transaction_')) {
+      const transactionId = data.replace('delete_transaction_', '');
+      await this.handleTransactionDelete(replyToken, userId, transactionId);
+    } else if (data.startsWith('confirm_delete_')) {
+      if (data === 'confirm_delete_cancel') {
+        await this.replyMessage(replyToken, '❌ 削除をキャンセルしました。');
+      } else {
+        const transactionId = data.replace('confirm_delete_', '');
+        await this.handleTransactionDeleteConfirm(replyToken, userId, transactionId);
+      }
     }
   }
 
   private async handleTextMessage(replyToken: string, userId: string, text: string): Promise<void> {
     const command = text.toLowerCase().trim();
+
+    // 削除待機状態のチェック
+    const pendingDelete = this.pendingDeletes.get(userId);
+    if (pendingDelete) {
+      if (command === 'はい' || command === 'yes' || command === '削除' || command === 'ok') {
+        await this.handleDirectDeleteConfirm(replyToken, userId, pendingDelete.transactionId);
+        this.pendingDeletes.delete(userId);
+        return;
+      } else if (command === 'いいえ' || command === 'no' || command === 'キャンセル' || command === 'cancel') {
+        await this.replyMessage(replyToken, '❌ 削除をキャンセルしました。');
+        this.pendingDeletes.delete(userId);
+        return;
+      } else {
+        await this.replyMessage(replyToken, '❌ "はい" または "いいえ" で答えてください。');
+        return;
+      }
+    }
+
+    // 編集待機状態のチェック
+    const pendingEdit = this.pendingEdits.get(userId);
+    if (pendingEdit) {
+      const amount = this.parseAmount(text);
+      if (amount > 0) {
+        await this.handleDirectEditAmount(replyToken, userId, pendingEdit.transactionId, amount);
+        this.pendingEdits.delete(userId);
+        return;
+      } else {
+        await this.replyMessage(replyToken, '❌ 正しい金額を入力してください。例: "2500"');
+        return;
+      }
+    }
 
     // 確認応答のチェック
     if (command === 'はい' || command === 'yes' || command === 'ok' || command === '確定') {
@@ -92,6 +162,9 @@ export class BudgetBot {
       await this.handleBudgetReset(replyToken, userId);
     } else if (command === 'ヘルプ' || command === 'help') {
       await this.handleHelp(replyToken);
+    } else if (text.startsWith('edit ')) {
+      // 取引編集コマンド: "edit transactionId newAmount"
+      await this.handleEditCommand(replyToken, userId, text);
     } else {
       // Try to parse as manual expense entry
       const amount = this.parseAmount(text);
@@ -186,7 +259,7 @@ export class BudgetBot {
       // 設定後に予算状況を表示
       const stats = await databaseService.getUserStats(userId);
       if (stats) {
-        const flexContent = this.createBudgetProgressCard(stats);
+        const flexContent = await this.createBudgetProgressCard(stats, userId);
         await this.pushFlexMessage(userId, '現在の予算状況', flexContent);
         
         const quickReplyItems = [
@@ -211,7 +284,7 @@ export class BudgetBot {
       }
 
       // Flex Messageでプログレスカードを送信
-      const flexContent = this.createBudgetProgressCard(stats);
+      const flexContent = await this.createBudgetProgressCard(stats, userId);
       await this.replyFlexMessage(replyToken, '予算状況', flexContent);
 
       // 詳細情報をクイックリプライ付きメッセージで送信
@@ -238,7 +311,7 @@ export class BudgetBot {
 
   private async handleTransactionHistory(replyToken: string, userId: string): Promise<void> {
     try {
-      const transactions = await databaseService.getRecentTransactions(userId, 5);
+      const transactions = await databaseService.getRecentTransactions(userId, 10);
       
       if (transactions.length === 0) {
         const message = '📝 まだ支出の履歴がありません。';
@@ -250,18 +323,9 @@ export class BudgetBot {
         return;
       }
 
-      let message = '📝 最近の支出履歴\n\n';
-      transactions.forEach((transaction: Transaction, index: number) => {
-        const date = new Date(transaction.createdAt).toLocaleDateString('ja-JP', {
-          month: 'short',
-          day: 'numeric',
-          hour: '2-digit',
-          minute: '2-digit'
-        });
-        message += `${index + 1}. ${transaction.amount.toLocaleString()}円\n`;
-        message += `   ${transaction.description || '説明なし'}\n`;
-        message += `   ${date}\n\n`;
-      });
+      // Flex Messageで取引一覧を表示
+      const flexContent = this.createTransactionListCard(transactions);
+      await this.replyFlexMessage(replyToken, '取引履歴', flexContent);
 
       const quickReplyItems = [
         { label: '📊 予算確認', text: '予算確認' },
@@ -269,17 +333,132 @@ export class BudgetBot {
         { label: '🔄 リセット', text: 'リセット' }
       ];
 
-      await this.replyMessageWithQuickReply(replyToken, message, quickReplyItems);
+      await this.pushMessageWithQuickReply(userId, '取引の編集・削除は各項目をタップしてください', quickReplyItems);
     } catch (error) {
       console.error('Transaction history error:', error);
       await this.replyMessage(replyToken, '❌ 履歴の取得中にエラーが発生しました。');
     }
   }
 
+  private createTransactionListCard(transactions: Transaction[]): any {
+    const bubbles = transactions.map((transaction: Transaction) => {
+      const date = new Date(transaction.createdAt).toLocaleDateString('ja-JP', {
+        month: 'short',
+        day: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit'
+      });
+
+      return {
+        type: 'bubble',
+        size: 'micro',
+        header: {
+          type: 'box',
+          layout: 'vertical',
+          contents: [
+            {
+              type: 'text',
+              text: `¥${transaction.amount.toLocaleString()}`,
+              weight: 'bold',
+              color: '#ffffff',
+              size: 'md'
+            },
+            {
+              type: 'text',
+              text: date,
+              color: '#ffffff',
+              size: 'xs'
+            }
+          ],
+          backgroundColor: '#17c950',
+          paddingTop: 'md',
+          paddingBottom: 'md',
+          paddingStart: 'md',
+          paddingEnd: 'md'
+        },
+        body: {
+          type: 'box',
+          layout: 'vertical',
+          contents: [
+            {
+              type: 'text',
+              text: transaction.description || '説明なし',
+              wrap: true,
+              color: '#666666',
+              size: 'sm'
+            }
+          ],
+          paddingTop: 'md',
+          paddingBottom: 'sm',
+          paddingStart: 'md',
+          paddingEnd: 'md'
+        },
+        footer: {
+          type: 'box',
+          layout: 'horizontal',
+          contents: [
+            {
+              type: 'button',
+              style: 'secondary',
+              height: 'sm',
+              action: {
+                type: 'postback',
+                label: '✏️ 編集',
+                data: `edit_transaction_${transaction.id}`
+              }
+            },
+            {
+              type: 'button',
+              style: 'secondary',
+              height: 'sm',
+              action: {
+                type: 'postback',
+                label: '🗑️ 削除',
+                data: `delete_transaction_${transaction.id}`
+              }
+            }
+          ],
+          spacing: 'sm',
+          paddingTop: 'sm',
+          paddingBottom: 'md',
+          paddingStart: 'md',
+          paddingEnd: 'md'
+        }
+      };
+    });
+
+    return {
+      type: 'carousel',
+      contents: bubbles
+    };
+  }
+
   private async handleBudgetReset(replyToken: string, userId: string): Promise<void> {
+    // リセット警告メッセージを表示
+    const warningMessage = '⚠️ 重要な警告\n\n' +
+      'すべての取引データが完全に削除されます。\n' +
+      'この操作は取り消すことができません。\n\n' +
+      '本当にリセットしますか？';
+
+    const actions = [
+      { label: '✅ リセット実行', data: 'confirm_reset_yes' },
+      { label: '❌ キャンセル', data: 'confirm_reset_no' }
+    ];
+
+    await this.pushButtonsMessage(userId, 'データリセット確認', warningMessage, actions);
+    await this.replyMessage(replyToken, '上記の確認メッセージをご確認ください。');
+  }
+
+  private async handleResetConfirmation(replyToken: string, userId: string, confirmed: boolean): Promise<void> {
+    if (!confirmed) {
+      await this.replyMessage(replyToken, '❌ リセットをキャンセルしました。');
+      return;
+    }
+
     try {
       await databaseService.resetMonthlyBudget(userId);
-      const message = '🔄 月間予算をリセットしました！\n使用済み金額が0円になりました。';
+      const message = '🔄 月間予算をリセットしました！\n' +
+        'すべての取引データと使用済み金額が削除されました。';
       
       const quickReplyItems = [
         { label: '📊 予算確認', text: '予算確認' },
@@ -361,7 +540,7 @@ export class BudgetBot {
       await this.replyMessage(replyToken, message);
 
       // Flex Messageで予算状況を表示
-      const flexContent = this.createBudgetProgressCard(stats);
+      const flexContent = await this.createBudgetProgressCard(stats, userId);
       await this.pushFlexMessage(userId, '更新された予算状況', flexContent);
 
       const quickReplyItems = [
@@ -399,18 +578,20 @@ export class BudgetBot {
     return '█'.repeat(Math.min(filled, bars)) + '░'.repeat(Math.max(empty, 0));
   }
 
-  private getBudgetPeriodStats(monthlyBudget: number, currentSpent: number): {
-    daily: { budget: number; spent: number; percentage: number; remaining: number };
+  private async getBudgetPeriodStats(monthlyBudget: number, currentSpent: number, userId: string): Promise<{
+    daily: { budget: number; spent: number; percentage: number; remaining: number; todaySpent: number };
     weekly: { budget: number; spent: number; percentage: number; remaining: number };
     monthly: { budget: number; spent: number; percentage: number; remaining: number };
-  } {
+  }> {
     const now = new Date();
     const year = now.getFullYear();
     const month = now.getMonth();
     
     // 今月の日数を取得
     const daysInMonth = new Date(year, month + 1, 0).getDate();
-    const currentDay = now.getDate();
+    
+    // 今日の支出を取得
+    const todaySpent = await databaseService.getTodaySpent(userId);
     
     // 今週の開始日（月曜日）を取得
     const weekStart = new Date(now);
@@ -426,11 +607,10 @@ export class BudgetBot {
     // 今週は何日あるか（月の境界を考慮）
     const daysInCurrentWeek = Math.min(7, Math.ceil((weekEnd.getTime() - weekStart.getTime()) / (1000 * 60 * 60 * 24)) + 1);
     
-    // 日毎予算計算
-    const dailyBudget = monthlyBudget / daysInMonth;
-    const dailyExpectedSpent = dailyBudget * currentDay;
-    const dailyPercentage = (currentSpent / dailyExpectedSpent) * 100;
-    const dailyRemaining = dailyExpectedSpent - currentSpent;
+    // 日毎予算計算（改善版）
+    const dailyBudget = monthlyBudget / daysInMonth; // 1日あたりの予算
+    const dailyRemaining = dailyBudget - todaySpent; // 今日の残り予算
+    const dailyPercentage = dailyBudget > 0 ? (todaySpent / dailyBudget) * 100 : 0;
     
     // 週毎予算計算
     const weeklyBudget = (monthlyBudget / daysInMonth) * daysInCurrentWeek;
@@ -443,8 +623,9 @@ export class BudgetBot {
     
     return {
       daily: {
-        budget: Math.round(dailyExpectedSpent),
-        spent: currentSpent,
+        budget: Math.round(dailyBudget),
+        spent: Math.round(todaySpent),
+        todaySpent: Math.round(todaySpent),
         percentage: Math.round(dailyPercentage * 10) / 10,
         remaining: Math.round(dailyRemaining)
       },
@@ -463,8 +644,16 @@ export class BudgetBot {
     };
   }
 
-  private createBudgetProgressCard(stats: any): any {
-    const periodStats = this.getBudgetPeriodStats(stats.monthlyBudget, stats.currentSpent);
+  private createProgressIndicator(percentage: number): string {
+    const totalDots = 10;
+    const filledDots = Math.min(Math.round((percentage / 100) * totalDots), totalDots);
+    const emptyDots = totalDots - filledDots;
+    
+    return '●'.repeat(filledDots) + '○'.repeat(emptyDots);
+  }
+
+  private async createBudgetProgressCard(stats: any, userId: string): Promise<any> {
+    const periodStats = await this.getBudgetPeriodStats(stats.monthlyBudget, stats.currentSpent, userId);
     
     // ステータスと色を決定
     const getStatusAndColor = (percentage: number) => {
@@ -482,29 +671,38 @@ export class BudgetBot {
       contents: [
         {
           type: 'bubble',
-          size: 'micro',
+          size: 'kilo',
           header: {
             type: 'box',
             layout: 'vertical',
             contents: [
               {
                 type: 'text',
-                text: '📅 Daily',
+                text: 'Daily',
                 weight: 'bold',
                 color: '#ffffff',
-                size: 'sm'
+                size: 'md',
+                align: 'center'
               },
               {
                 type: 'text',
-                text: `${periodStats.daily.percentage}%`,
+                text: `¥${Math.max(0, periodStats.daily.remaining).toLocaleString()}`,
                 weight: 'bold',
                 color: '#ffffff',
-                size: 'lg'
+                size: 'xl',
+                align: 'center'
+              },
+              {
+                type: 'text',
+                text: '残り',
+                color: '#ffffff',
+                size: 'xs',
+                align: 'center'
               }
             ],
             backgroundColor: dailyStatus.color,
-            paddingTop: 'md',
-            paddingBottom: 'xs',
+            paddingTop: 'lg',
+            paddingBottom: 'lg',
             paddingStart: 'md',
             paddingEnd: 'md'
           },
@@ -513,85 +711,89 @@ export class BudgetBot {
             layout: 'vertical',
             contents: [
               {
+                type: 'text',
+                text: this.createProgressIndicator(periodStats.daily.percentage),
+                size: 'lg',
+                color: '#666666',
+                align: 'center',
+                margin: 'md'
+              },
+              {
                 type: 'box',
                 layout: 'vertical',
                 margin: 'lg',
-                spacing: 'sm',
+                spacing: 'md',
                 contents: [
                   {
-                    type: 'box',
-                    layout: 'baseline',
-                    spacing: 'sm',
-                    contents: [
-                      {
-                        type: 'text',
-                        text: 'Used',
-                        color: '#aaaaaa',
-                        size: 'sm',
-                        flex: 1
-                      },
-                      {
-                        type: 'text',
-                        text: `¥${periodStats.daily.spent.toLocaleString()}`,
-                        wrap: true,
-                        color: '#666666',
-                        size: 'sm',
-                        flex: 2
-                      }
-                    ]
+                    type: 'text',
+                    text: '今日の支出',
+                    color: '#aaaaaa',
+                    size: 'sm'
                   },
                   {
-                    type: 'box',
-                    layout: 'baseline',
-                    spacing: 'sm',
-                    contents: [
-                      {
-                        type: 'text',
-                        text: 'Budget',
-                        color: '#aaaaaa',
-                        size: 'sm',
-                        flex: 1
-                      },
-                      {
-                        type: 'text',
-                        text: `¥${periodStats.daily.budget.toLocaleString()}`,
-                        wrap: true,
-                        color: '#666666',
-                        size: 'sm',
-                        flex: 2
-                      }
-                    ]
+                    type: 'text',
+                    text: `¥${periodStats.daily.todaySpent.toLocaleString()}`,
+                    color: '#666666',
+                    size: 'md',
+                    weight: 'bold'
+                  },
+                  {
+                    type: 'text',
+                    text: '1日あたりの予算',
+                    color: '#aaaaaa',
+                    size: 'sm',
+                    margin: 'md'
+                  },
+                  {
+                    type: 'text',
+                    text: `¥${periodStats.daily.budget.toLocaleString()}`,
+                    color: '#666666',
+                    size: 'md',
+                    weight: 'bold'
                   }
                 ]
               }
-            ]
+            ],
+            paddingTop: 'lg',
+            paddingBottom: 'lg',
+            paddingStart: 'lg',
+            paddingEnd: 'lg'
           }
         },
         {
           type: 'bubble',
-          size: 'micro',
+          size: 'kilo',
           header: {
             type: 'box',
             layout: 'vertical',
             contents: [
               {
                 type: 'text',
-                text: '📊 Weekly',
+                text: 'Weekly',
                 weight: 'bold',
                 color: '#ffffff',
-                size: 'sm'
+                size: 'md',
+                align: 'center'
               },
               {
                 type: 'text',
-                text: `${periodStats.weekly.percentage}%`,
+                text: `¥${Math.max(0, periodStats.weekly.remaining).toLocaleString()}`,
                 weight: 'bold',
                 color: '#ffffff',
-                size: 'lg'
+                size: 'xl',
+                align: 'center'
+              },
+              {
+                type: 'text',
+                text: '残り',
+                color: '#ffffff',
+                size: 'xs',
+                align: 'center'
               }
             ],
             backgroundColor: weeklyStatus.color,
-            paddingTop: 'md',
-            paddingBottom: 'xs',
+            paddingTop: 'lg',
+            paddingBottom: 'lg',
             paddingStart: 'md',
             paddingEnd: 'md'
           },
@@ -600,85 +802,89 @@ export class BudgetBot {
             layout: 'vertical',
             contents: [
               {
+                type: 'text',
+                text: this.createProgressIndicator(periodStats.weekly.percentage),
+                size: 'lg',
+                color: '#666666',
+                align: 'center',
+                margin: 'md'
+              },
+              {
                 type: 'box',
                 layout: 'vertical',
                 margin: 'lg',
-                spacing: 'sm',
+                spacing: 'md',
                 contents: [
                   {
-                    type: 'box',
-                    layout: 'baseline',
-                    spacing: 'sm',
-                    contents: [
-                      {
-                        type: 'text',
-                        text: 'Used',
-                        color: '#aaaaaa',
-                        size: 'sm',
-                        flex: 1
-                      },
-                      {
-                        type: 'text',
-                        text: `¥${periodStats.weekly.spent.toLocaleString()}`,
-                        wrap: true,
-                        color: '#666666',
-                        size: 'sm',
-                        flex: 2
-                      }
-                    ]
+                    type: 'text',
+                    text: '今週の支出',
+                    color: '#aaaaaa',
+                    size: 'sm'
                   },
                   {
-                    type: 'box',
-                    layout: 'baseline',
-                    spacing: 'sm',
-                    contents: [
-                      {
-                        type: 'text',
-                        text: 'Budget',
-                        color: '#aaaaaa',
-                        size: 'sm',
-                        flex: 1
-                      },
-                      {
-                        type: 'text',
-                        text: `¥${periodStats.weekly.budget.toLocaleString()}`,
-                        wrap: true,
-                        color: '#666666',
-                        size: 'sm',
-                        flex: 2
-                      }
-                    ]
+                    type: 'text',
+                    text: `¥${periodStats.weekly.spent.toLocaleString()}`,
+                    color: '#666666',
+                    size: 'md',
+                    weight: 'bold'
+                  },
+                  {
+                    type: 'text',
+                    text: '今週の予算',
+                    color: '#aaaaaa',
+                    size: 'sm',
+                    margin: 'md'
+                  },
+                  {
+                    type: 'text',
+                    text: `¥${periodStats.weekly.budget.toLocaleString()}`,
+                    color: '#666666',
+                    size: 'md',
+                    weight: 'bold'
                   }
                 ]
               }
-            ]
+            ],
+            paddingTop: 'lg',
+            paddingBottom: 'lg',
+            paddingStart: 'lg',
+            paddingEnd: 'lg'
           }
         },
         {
           type: 'bubble',
-          size: 'micro',
+          size: 'kilo',
           header: {
             type: 'box',
             layout: 'vertical',
             contents: [
               {
                 type: 'text',
-                text: '📈 Monthly',
+                text: 'Monthly',
                 weight: 'bold',
                 color: '#ffffff',
-                size: 'sm'
+                size: 'md',
+                align: 'center'
               },
               {
                 type: 'text',
-                text: `${periodStats.monthly.percentage}%`,
+                text: `¥${Math.max(0, periodStats.monthly.remaining).toLocaleString()}`,
                 weight: 'bold',
                 color: '#ffffff',
-                size: 'lg'
+                size: 'xl',
+                align: 'center'
+              },
+              {
+                type: 'text',
+                text: '残り',
+                color: '#ffffff',
+                size: 'xs',
+                align: 'center'
               }
             ],
             backgroundColor: monthlyStatus.color,
-            paddingTop: 'md',
-            paddingBottom: 'xs',
+            paddingTop: 'lg',
+            paddingBottom: 'lg',
             paddingStart: 'md',
             paddingEnd: 'md'
           },
@@ -687,58 +893,53 @@ export class BudgetBot {
             layout: 'vertical',
             contents: [
               {
+                type: 'text',
+                text: this.createProgressIndicator(periodStats.monthly.percentage),
+                size: 'lg',
+                color: '#666666',
+                align: 'center',
+                margin: 'md'
+              },
+              {
                 type: 'box',
                 layout: 'vertical',
                 margin: 'lg',
-                spacing: 'sm',
+                spacing: 'md',
                 contents: [
                   {
-                    type: 'box',
-                    layout: 'baseline',
-                    spacing: 'sm',
-                    contents: [
-                      {
-                        type: 'text',
-                        text: 'Used',
-                        color: '#aaaaaa',
-                        size: 'sm',
-                        flex: 1
-                      },
-                      {
-                        type: 'text',
-                        text: `¥${periodStats.monthly.spent.toLocaleString()}`,
-                        wrap: true,
-                        color: '#666666',
-                        size: 'sm',
-                        flex: 2
-                      }
-                    ]
+                    type: 'text',
+                    text: '今月の支出',
+                    color: '#aaaaaa',
+                    size: 'sm'
                   },
                   {
-                    type: 'box',
-                    layout: 'baseline',
-                    spacing: 'sm',
-                    contents: [
-                      {
-                        type: 'text',
-                        text: 'Budget',
-                        color: '#aaaaaa',
-                        size: 'sm',
-                        flex: 1
-                      },
-                      {
-                        type: 'text',
-                        text: `¥${periodStats.monthly.budget.toLocaleString()}`,
-                        wrap: true,
-                        color: '#666666',
-                        size: 'sm',
-                        flex: 2
-                      }
-                    ]
+                    type: 'text',
+                    text: `¥${periodStats.monthly.spent.toLocaleString()}`,
+                    color: '#666666',
+                    size: 'md',
+                    weight: 'bold'
+                  },
+                  {
+                    type: 'text',
+                    text: '月間予算',
+                    color: '#aaaaaa',
+                    size: 'sm',
+                    margin: 'md'
+                  },
+                  {
+                    type: 'text',
+                    text: `¥${periodStats.monthly.budget.toLocaleString()}`,
+                    color: '#666666',
+                    size: 'md',
+                    weight: 'bold'
                   }
                 ]
               }
-            ]
+            ],
+            paddingTop: 'lg',
+            paddingBottom: 'lg',
+            paddingStart: 'lg',
+            paddingEnd: 'lg'
           }
         }
       ]
@@ -1032,7 +1233,7 @@ export class BudgetBot {
       await this.pushMessage(userId, message);
 
       // Flex Messageで予算状況を表示
-      const flexContent = this.createBudgetProgressCard(stats);
+      const flexContent = await this.createBudgetProgressCard(stats, userId);
       await this.pushFlexMessage(userId, '更新された予算状況', flexContent);
 
       const quickReplyItems = [
@@ -1045,6 +1246,194 @@ export class BudgetBot {
     } catch (error) {
       console.error('Add expense with push error:', error);
       await this.pushMessage(userId, '❌ 支出の記録中にエラーが発生しました。');
+    }
+  }
+
+  private async handleTransactionEdit(replyToken: string, userId: string, transactionId: string): Promise<void> {
+    try {
+      // 取引情報を取得して表示
+      const transactions = await databaseService.getRecentTransactions(userId, 50);
+      const transactionIdNum = parseInt(transactionId);
+      const transaction = transactions.find((t: Transaction) => t.id === transactionIdNum);
+      
+      if (!transaction) {
+        await this.replyMessage(replyToken, '❌ 取引が見つかりません。');
+        return;
+      }
+
+      // 編集待機状態を設定
+      this.pendingEdits.set(userId, {
+        userId,
+        transactionId: transactionIdNum,
+        timestamp: Date.now()
+      });
+
+      const message = `✏️ 取引の編集\n\n` +
+        `現在の金額: ${transaction.amount.toLocaleString()}円\n` +
+        `内容: ${transaction.description}\n\n` +
+        `新しい金額を入力してください。\n` +
+        `例: "2500"`;
+
+      await this.replyMessage(replyToken, message);
+    } catch (error) {
+      console.error('Transaction edit error:', error);
+      await this.replyMessage(replyToken, '❌ 取引編集の準備中にエラーが発生しました。');
+    }
+  }
+
+  private async handleTransactionDelete(replyToken: string, userId: string, transactionId: string): Promise<void> {
+    try {
+      // 取引情報を取得して確認メッセージを表示
+      const transactions = await databaseService.getRecentTransactions(userId, 50);
+      const transactionIdNum = parseInt(transactionId);
+      const transaction = transactions.find((t: Transaction) => t.id === transactionIdNum);
+      
+      if (!transaction) {
+        await this.replyMessage(replyToken, '❌ 取引が見つかりません。');
+        return;
+      }
+
+      // 削除待機状態を設定
+      this.pendingDeletes.set(userId, {
+        userId,
+        transactionId: transactionIdNum,
+        timestamp: Date.now()
+      });
+
+      const confirmMessage = `🗑️ 取引の削除確認\n\n` +
+        `金額: ${transaction.amount.toLocaleString()}円\n` +
+        `内容: ${transaction.description}\n` +
+        `日時: ${new Date(transaction.createdAt).toLocaleString('ja-JP')}\n\n` +
+        `この取引を削除しますか？\n` +
+        `"はい" または "いいえ" で答えてください。`;
+
+      await this.replyMessage(replyToken, confirmMessage);
+    } catch (error) {
+      console.error('Transaction delete error:', error);
+      await this.replyMessage(replyToken, '❌ 取引削除の準備中にエラーが発生しました。');
+    }
+  }
+
+  private async handleDirectEditAmount(replyToken: string, userId: string, transactionId: number, newAmount: number): Promise<void> {
+    try {
+      const updatedTransaction = await databaseService.editTransaction(userId, transactionId, newAmount);
+      
+      const message = `✅ 取引を編集しました\n\n` +
+        `新しい金額: ${newAmount.toLocaleString()}円\n` +
+        `内容: ${updatedTransaction.description}`;
+
+      await this.replyMessage(replyToken, message);
+
+      // 更新された予算状況を表示
+      const stats = await databaseService.getUserStats(userId);
+      if (stats) {
+        const flexContent = await this.createBudgetProgressCard(stats, userId);
+        await this.pushFlexMessage(userId, '更新された予算状況', flexContent);
+      }
+    } catch (error) {
+      console.error('Direct edit error:', error);
+      if (error instanceof Error && error.message === 'Transaction not found') {
+        await this.replyMessage(replyToken, '❌ 指定された取引が見つかりません。');
+      } else {
+        await this.replyMessage(replyToken, '❌ 取引の編集中にエラーが発生しました。');
+      }
+    }
+  }
+
+  private async handleDirectDeleteConfirm(replyToken: string, userId: string, transactionId: number): Promise<void> {
+    try {
+      const result = await databaseService.deleteTransaction(userId, transactionId);
+      
+      const message = `✅ 取引を削除しました\n\n` +
+        `削除された金額: ${result.deletedAmount.toLocaleString()}円`;
+
+      await this.replyMessage(replyToken, message);
+
+      // 更新された予算状況を表示
+      const stats = await databaseService.getUserStats(userId);
+      if (stats) {
+        const flexContent = await this.createBudgetProgressCard(stats, userId);
+        await this.pushFlexMessage(userId, '更新された予算状況', flexContent);
+      }
+    } catch (error) {
+      console.error('Direct delete error:', error);
+      if (error instanceof Error && error.message === 'Transaction not found') {
+        await this.replyMessage(replyToken, '❌ 指定された取引が見つかりません。');
+      } else {
+        await this.replyMessage(replyToken, '❌ 取引の削除中にエラーが発生しました。');
+      }
+    }
+  }
+
+  private async handleEditCommand(replyToken: string, userId: string, text: string): Promise<void> {
+    try {
+      // "edit transactionId newAmount" の形式をパース
+      const parts = text.split(' ');
+      if (parts.length !== 3) {
+        await this.replyMessage(replyToken, '❌ 編集コマンドの形式が正しくありません。\n例: "edit 123 2500"');
+        return;
+      }
+
+      const transactionId = parseInt(parts[1]);
+      const newAmount = parseInt(parts[2]);
+      
+      if (isNaN(transactionId) || isNaN(newAmount) || newAmount <= 0) {
+        await this.replyMessage(replyToken, '❌ 有効なIDと金額を入力してください。');
+        return;
+      }
+
+      const updatedTransaction = await databaseService.editTransaction(userId, transactionId, newAmount);
+      
+      const message = `✅ 取引を編集しました\n\n` +
+        `新しい金額: ${newAmount.toLocaleString()}円\n` +
+        `内容: ${updatedTransaction.description}`;
+
+      await this.replyMessage(replyToken, message);
+
+      // 更新された予算状況を表示
+      const stats = await databaseService.getUserStats(userId);
+      if (stats) {
+        const flexContent = await this.createBudgetProgressCard(stats, userId);
+        await this.pushFlexMessage(userId, '更新された予算状況', flexContent);
+      }
+    } catch (error) {
+      console.error('Edit command error:', error);
+      if (error instanceof Error && error.message === 'Transaction not found') {
+        await this.replyMessage(replyToken, '❌ 指定された取引が見つかりません。');
+      } else {
+        await this.replyMessage(replyToken, '❌ 取引の編集中にエラーが発生しました。');
+      }
+    }
+  }
+
+  private async handleTransactionDeleteConfirm(replyToken: string, userId: string, transactionId: string): Promise<void> {
+    try {
+      const transactionIdNum = parseInt(transactionId);
+      if (isNaN(transactionIdNum)) {
+        await this.replyMessage(replyToken, '❌ 無効な取引IDです。');
+        return;
+      }
+
+      const result = await databaseService.deleteTransaction(userId, transactionIdNum);
+      
+      const message = `✅ 取引を削除しました\n\n` +
+        `削除された金額: ${result.deletedAmount.toLocaleString()}円`;
+
+      await this.replyMessage(replyToken, message);
+
+      // 更新された予算状況を表示
+      const stats = await databaseService.getUserStats(userId);
+      if (stats) {
+        const flexContent = await this.createBudgetProgressCard(stats, userId);
+        await this.pushFlexMessage(userId, '更新された予算状況', flexContent);
+      }
+    } catch (error) {
+      console.error('Delete confirm error:', error);
+      if (error instanceof Error && error.message === 'Transaction not found') {
+        await this.replyMessage(replyToken, '❌ 指定された取引が見つかりません。');
+      } else {
+        await this.replyMessage(replyToken, '❌ 取引の削除中にエラーが発生しました。');
+      }
     }
   }
 }

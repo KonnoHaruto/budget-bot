@@ -58,10 +58,98 @@ export class DatabaseService {
   }
 
   async resetMonthlyBudget(lineUserId: string) {
-    return await prisma.user.update({
-      where: { lineUserId },
-      data: { currentSpent: 0 }
+    const user = await this.getUser(lineUserId);
+    if (!user) {
+      throw new Error('User not found');
+    }
+
+    // トランザクションで取引データを削除し、currentSpentをリセット
+    await prisma.$transaction([
+      prisma.transaction.deleteMany({
+        where: { userId: user.id }
+      }),
+      prisma.user.update({
+        where: { lineUserId },
+        data: { currentSpent: 0 }
+      })
+    ]);
+
+    return { success: true };
+  }
+
+  async editTransaction(lineUserId: string, transactionId: number, newAmount: number) {
+    const user = await this.getUser(lineUserId);
+    if (!user) {
+      throw new Error('User not found');
+    }
+
+    // 既存の取引を取得
+    const existingTransaction = await prisma.transaction.findFirst({
+      where: { 
+        id: transactionId,
+        userId: user.id 
+      }
     });
+
+    if (!existingTransaction) {
+      throw new Error('Transaction not found');
+    }
+
+    const amountDifference = newAmount - existingTransaction.amount;
+
+    // トランザクションで取引を更新し、ユーザーの累計を調整
+    const [updatedTransaction] = await prisma.$transaction([
+      prisma.transaction.update({
+        where: { id: transactionId },
+        data: { amount: newAmount }
+      }),
+      prisma.user.update({
+        where: { lineUserId },
+        data: {
+          currentSpent: {
+            increment: amountDifference
+          }
+        }
+      })
+    ]);
+
+    return updatedTransaction;
+  }
+
+  async deleteTransaction(lineUserId: string, transactionId: number) {
+    const user = await this.getUser(lineUserId);
+    if (!user) {
+      throw new Error('User not found');
+    }
+
+    // 既存の取引を取得
+    const existingTransaction = await prisma.transaction.findFirst({
+      where: { 
+        id: transactionId,
+        userId: user.id 
+      }
+    });
+
+    if (!existingTransaction) {
+      throw new Error('Transaction not found');
+    }
+
+    // トランザクションで取引を削除し、ユーザーの累計を調整
+    await prisma.$transaction([
+      prisma.transaction.delete({
+        where: { id: transactionId }
+      }),
+      prisma.user.update({
+        where: { lineUserId },
+        data: {
+          currentSpent: {
+            decrement: existingTransaction.amount
+          }
+        }
+      })
+    ]);
+
+    return { success: true, deletedAmount: existingTransaction.amount };
   }
 
   async getRecentTransactions(lineUserId: string, limit: number = 10) {
@@ -73,6 +161,31 @@ export class DatabaseService {
       orderBy: { createdAt: 'desc' },
       take: limit
     });
+  }
+
+  async getTodaySpent(lineUserId: string) {
+    const user = await this.getUser(lineUserId);
+    if (!user) return 0;
+
+    // 今日の開始時刻（00:00:00）
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    
+    // 今日の終了時刻（23:59:59.999）
+    const endOfToday = new Date();
+    endOfToday.setHours(23, 59, 59, 999);
+
+    const todayTransactions = await prisma.transaction.findMany({
+      where: {
+        userId: user.id,
+        createdAt: {
+          gte: today,
+          lte: endOfToday
+        }
+      }
+    });
+
+    return todayTransactions.reduce((total, transaction) => total + transaction.amount, 0);
   }
 
   async getUserStats(lineUserId: string) {
