@@ -49,16 +49,22 @@ async function handleEvent(event: line.WebhookEvent): Promise<void> {
     source: event.source
   });
 
-  if (event.type !== 'message') {
-    console.log('⏩ Skipping non-message event:', event.type);
-    return;
-  }
-
-  try {
-    await budgetBot.handleMessage(event);
-    console.log('✅ Message handled successfully');
-  } catch (error) {
-    console.error('❌ Event handling error:', error);
+  if (event.type === 'message') {
+    try {
+      await budgetBot.handleMessage(event);
+      console.log('✅ Message handled successfully');
+    } catch (error) {
+      console.error('❌ Event handling error:', error);
+    }
+  } else if (event.type === 'postback') {
+    try {
+      await budgetBot.handlePostback(event);
+      console.log('✅ Postback handled successfully');
+    } catch (error) {
+      console.error('❌ Postback handling error:', error);
+    }
+  } else {
+    console.log('⏩ Skipping event type:', event.type);
   }
 }
 
