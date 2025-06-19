@@ -3,6 +3,7 @@ import { databaseService } from '../database/prisma';
 import { ocrService } from '../services/ocrService';
 import { CurrencyService, ParsedAmount } from '../services/currencyService';
 import { chartService, ChartData } from '../services/chartService';
+import { RichMenuService } from '../services/richMenuService';
 import { PrismaClient } from '@prisma/client';
 
 type Transaction = {
@@ -31,6 +32,7 @@ interface PendingEdit {
 export class BudgetBot {
   private client: line.messagingApi.MessagingApiClient;
   private blobClient: line.messagingApi.MessagingApiBlobClient;
+  private richMenuService: RichMenuService;
   private pendingTransactions: Map<string, PendingTransaction> = new Map();
   private pendingEdits: Map<string, PendingEdit> = new Map();
 
@@ -41,6 +43,16 @@ export class BudgetBot {
     };
     this.client = new line.messagingApi.MessagingApiClient(config);
     this.blobClient = new line.messagingApi.MessagingApiBlobClient(config);
+    this.richMenuService = new RichMenuService(this.client);
+  }
+
+  async initializeRichMenu(): Promise<void> {
+    try {
+      await this.richMenuService.setupRichMenu();
+      console.log('🎉 Rich menu initialized successfully');
+    } catch (error) {
+      console.error('❌ Rich menu initialization failed:', error);
+    }
   }
 
   async handleMessage(event: line.MessageEvent): Promise<void> {
@@ -136,19 +148,27 @@ export class BudgetBot {
       return;
     }
 
-    if (command.startsWith('予算設定') || command.startsWith('budget set')) {
+    // リッチメニューからのメッセージ処理
+    if (command === '予算設定') {
+      await this.handleBudgetSetInstruction(replyToken);
+    } else if (command === '支出を記録') {
+      await this.handleManualExpenseEntry(replyToken);
+    } else if (command === 'レシート取込') {
+      await this.handleReceiptUploadInstruction(replyToken);
+    } else if (command === '今日の残高') {
+      await this.handleTodayBalance(replyToken, userId);
+    } else if (command === 'レポート') {
+      await this.handleReport(replyToken, userId);
+    } else if (command === 'ヘルプ') {
+      await this.handleHelp(replyToken);
+    } else if (command.startsWith('予算設定') || command.startsWith('budget set')) {
       await this.handleBudgetSet(replyToken, userId, text);
-    } else if (command === '予算設定') {
-      // クイックリプライ用の予算設定メニューを表示
-      await this.showBudgetSetMenu(replyToken);
     } else if (command === '予算確認' || command === 'budget' || command === 'status') {
       await this.handleBudgetStatus(replyToken, userId);
     } else if (command === '履歴' || command === 'history') {
       await this.handleTransactionHistory(replyToken, userId);
     } else if (command === 'リセット' || command === 'reset') {
       await this.handleBudgetReset(replyToken, userId);
-    } else if (command === 'ヘルプ' || command === 'help') {
-      await this.handleHelp(replyToken);
     } else if (text.startsWith('edit ')) {
       // 取引編集コマンド: "edit transactionId newAmount"
       await this.handleEditCommand(replyToken, userId, text);
@@ -248,13 +268,7 @@ export class BudgetBot {
       if (stats) {
         const flexContent = await this.createBudgetProgressCard(stats, userId);
         await this.pushFlexMessage(userId, '現在の予算状況', flexContent);
-        
-        const quickReplyItems = [
-          { label: '📝 履歴確認', text: '履歴' },
-          { label: '🔄 リセット', text: 'リセット' }
-        ];
-        
-        await this.pushMessageWithQuickReply(userId, '予算設定が完了しました！', quickReplyItems);
+        await this.pushMessage(userId, '✅ 予算設定が完了しました！');
       }
     } catch (error) {
       console.error('Budget set error:', error);
@@ -287,26 +301,13 @@ export class BudgetBot {
       const transactions = await databaseService.getRecentTransactions(userId, 10);
       
       if (transactions.length === 0) {
-        const message = '📝 まだ支出の履歴がありません。';
-        const quickReplyItems = [
-          { label: '💰 予算設定', text: '予算設定' },
-          { label: '📊 予算確認', text: '予算確認' }
-        ];
-        await this.replyMessageWithQuickReply(replyToken, message, quickReplyItems);
+        await this.replyMessage(replyToken, '📝 まだ支出の履歴がありません。');
         return;
       }
 
       // Flex Messageで取引一覧を表示
       const flexContent = this.createTransactionListCard(transactions);
       await this.replyFlexMessage(replyToken, '取引履歴', flexContent);
-
-      const quickReplyItems = [
-        { label: '📊 予算確認', text: '予算確認' },
-        { label: '💰 予算設定', text: '予算設定' },
-        { label: '🔄 リセット', text: 'リセット' }
-      ];
-
-      await this.pushMessageWithQuickReply(userId, '取引の編集・削除は各項目をタップしてください', quickReplyItems);
     } catch (error) {
       console.error('Transaction history error:', error);
       await this.replyMessage(replyToken, '❌ 履歴の取得中にエラーが発生しました。');
@@ -433,13 +434,7 @@ export class BudgetBot {
       const message = '🔄 月間予算をリセットしました！\n' +
         'すべての取引データと使用済み金額が削除されました。';
       
-      const quickReplyItems = [
-        { label: '📊 予算確認', text: '予算確認' },
-        { label: '💰 予算設定', text: '予算設定' },
-        { label: '📝 履歴確認', text: '履歴' }
-      ];
-
-      await this.replyMessageWithQuickReply(replyToken, message, quickReplyItems);
+      await this.replyMessage(replyToken, message);
     } catch (error) {
       console.error('Budget reset error:', error);
       await this.replyMessage(replyToken, '❌ 予算リセット中にエラーが発生しました。');
@@ -447,51 +442,99 @@ export class BudgetBot {
   }
 
   private async handleHelp(replyToken: string): Promise<void> {
-    const helpMessage = `📖 予算管理BOTの使い方\n\n` +
-      `💰 予算設定: クイックリプライまたは "予算設定 50000" で設定\n` +
-      `📷 支出記録: レシートの写真を送信すると自動で金額を読み取り\n` +
-      `✏️ 手動入力: "1500" のように金額を入力\n\n` +
-      `下のクイックリプライボタンで簡単操作できます！`;
+    const helpMessage = `📖 予算管理ボットの使い方\n\n` +
+      `💰 予算設定: 月額予算を設定・変更\n` +
+      `📝 支出を記録: 金額とメモを手動入力\n` +
+      `📷 レシート取込: レシート写真から金額を自動抽出\n` +
+      `💵 今日の残高: 今日使える額と残り日数を表示\n` +
+      `📊 レポート: 週や月ごとの支出グラフを表示\n` +
+      `⚙️ 設定・ヘルプ: 各種設定とヘルプ参照\n\n` +
+      `💡 下のメニューからお選びください！`;
 
-    const quickReplyItems = [
-      { label: '📊 予算確認', text: '予算確認' },
-      { label: '📝 履歴確認', text: '履歴' },
-      { label: '💰 予算設定', text: '予算設定' },
-      { label: '🔄 リセット', text: 'リセット' }
-    ];
+    await this.replyMessage(replyToken, helpMessage);
+  }
 
+  private async handleManualExpenseEntry(replyToken: string): Promise<void> {
+    const message = `📝 支出を記録\n\n` +
+      `金額を数字で入力してください。\n` +
+      `例: "2500"\n\n` +
+      `💡 金額のみ入力すると「手動入力」として記録されます。`;
+
+    await this.replyMessage(replyToken, message);
+  }
+
+  private async handleReceiptUploadInstruction(replyToken: string): Promise<void> {
+    const message = `📷 レシート取込\n\n` +
+      `レシートの写真を撮影して送信してください。\n\n` +
+      `✅ 自動で金額を読み取ります\n` +
+      `✅ 外貨にも対応しています\n` +
+      `✅ 店舗名も認識可能です\n\n` +
+      `💡 写真は鮮明に撮影してください！`;
+
+    await this.replyMessage(replyToken, message);
+  }
+
+  private async handleTodayBalance(replyToken: string, userId: string): Promise<void> {
     try {
-      await this.replyMessageWithQuickReply(replyToken, helpMessage, quickReplyItems);
+      const stats = await databaseService.getUserStats(userId);
+      if (!stats) {
+        await this.replyMessage(replyToken, '❌ ユーザー情報が見つかりません。まず予算を設定してください。');
+        return;
+      }
+
+      const todaySpent = await databaseService.getTodaySpent(userId);
+      const today = new Date();
+      const lastDayOfMonth = new Date(today.getFullYear(), today.getMonth() + 1, 0).getDate();
+      const remainingDays = lastDayOfMonth - today.getDate() + 1;
+      
+      const monthlyRemaining = Math.max(0, stats.monthlyBudget - stats.currentSpent);
+      const dailyBudget = remainingDays > 0 ? Math.floor(monthlyRemaining / remainingDays) : 0;
+      const todayRemaining = Math.max(0, dailyBudget - todaySpent);
+
+      const message = `💵 今日の残高\n\n` +
+        `📅 今日: ${today.getMonth() + 1}/${today.getDate()}\n` +
+        `💰 今日使用可能: ¥${todayRemaining.toLocaleString()}\n` +
+        `📊 今日の支出: ¥${todaySpent.toLocaleString()}\n` +
+        `📆 残り日数: ${remainingDays}日\n\n` +
+        `💡 1日平均予算: ¥${dailyBudget.toLocaleString()}`;
+
+      await this.replyMessage(replyToken, message);
     } catch (error) {
-      console.error('Help message with quick reply error:', error);
-      // フォールバック: 通常のテキストメッセージを送信
-      await this.replyMessage(replyToken, helpMessage);
+      console.error('Today balance error:', error);
+      await this.replyMessage(replyToken, '❌ 残高の取得中にエラーが発生しました。');
     }
   }
 
-  private async showBudgetSetMenu(replyToken: string): Promise<void> {
-    const budgetMessage = `💰 月間予算を設定してください\n\n` +
-      `よく使われる予算額から選択するか、\n` +
-      `「予算設定 50000」のように具体的な金額を入力してください。`;
-
-    const quickReplyItems = [
-      { label: '💸 30,000円', text: '予算設定 30000' },
-      { label: '💸 50,000円', text: '予算設定 50000' },
-      { label: '💸 70,000円', text: '予算設定 70000' },
-      { label: '💸 100,000円', text: '予算設定 100000' },
-      { label: '💸 150,000円', text: '予算設定 150000' },
-      { label: '💸 200,000円', text: '予算設定 200000' },
-      { label: '✏️ 手動入力', text: '予算設定 ' },
-      { label: '🔙 メニューに戻る', text: 'ヘルプ' }
-    ];
-
+  private async handleReport(replyToken: string, userId: string): Promise<void> {
     try {
-      await this.replyMessageWithQuickReply(replyToken, budgetMessage, quickReplyItems);
+      const stats = await databaseService.getUserStats(userId);
+      if (!stats) {
+        await this.replyMessage(replyToken, '❌ ユーザー情報が見つかりません。まず予算を設定してください。');
+        return;
+      }
+
+      // 予算確認と同じカードを表示
+      const flexContent = await this.createBudgetProgressCard(stats, userId);
+      await this.replyFlexMessage(replyToken, '📊 支出レポート', flexContent);
     } catch (error) {
-      console.error('Budget set menu error:', error);
-      await this.replyMessage(replyToken, budgetMessage);
+      console.error('Report error:', error);
+      await this.replyMessage(replyToken, '❌ レポートの生成中にエラーが発生しました。');
     }
   }
+
+  private async handleBudgetSetInstruction(replyToken: string): Promise<void> {
+    const message = `💰 予算設定\n\n` +
+      `月間予算を設定してください。\n` +
+      `「予算設定 50000」のように入力してください。\n\n` +
+      `例:\n` +
+      `・予算設定 30000\n` +
+      `・予算設定 50000\n` +
+      `・予算設定 100000\n\n` +
+      `💡 数字のみでも設定可能です！`;
+
+    await this.replyMessage(replyToken, message);
+  }
+
 
   private async addExpense(replyToken: string, userId: string, amount: number, description: string): Promise<void> {
     try {
@@ -515,14 +558,6 @@ export class BudgetBot {
       // Flex Messageで予算状況を表示
       const flexContent = await this.createBudgetProgressCard(stats, userId);
       await this.pushFlexMessage(userId, '更新された予算状況', flexContent);
-
-      const quickReplyItems = [
-        { label: '📊 予算確認', text: '予算確認' },
-        { label: '📝 履歴確認', text: '履歴' },
-        { label: '💰 予算設定', text: '予算設定' }
-      ];
-
-      await this.pushMessageWithQuickReply(userId, '次の操作を選択してください', quickReplyItems);
     } catch (error) {
       console.error('Add expense error:', error);
       await this.replyMessage(replyToken, '❌ 支出の記録中にエラーが発生しました。');
@@ -1823,61 +1858,6 @@ export class BudgetBot {
     }
   }
 
-  private async replyMessageWithQuickReply(
-    replyToken: string, 
-    text: string, 
-    quickReplyItems: { label: string; text: string }[]
-  ): Promise<void> {
-    try {
-      await this.client.replyMessage({
-        replyToken,
-        messages: [{
-          type: 'text',
-          text,
-          quickReply: {
-            items: quickReplyItems.map(item => ({
-              type: 'action',
-              action: {
-                type: 'message',
-                label: item.label,
-                text: item.text
-              }
-            }))
-          }
-        }]
-      });
-    } catch (error) {
-      console.error('Reply message with quick reply error:', error);
-    }
-  }
-
-  async pushMessageWithQuickReply(
-    userId: string, 
-    text: string, 
-    quickReplyItems: { label: string; text: string }[]
-  ): Promise<void> {
-    try {
-      await this.client.pushMessage({
-        to: userId,
-        messages: [{
-          type: 'text',
-          text,
-          quickReply: {
-            items: quickReplyItems.map(item => ({
-              type: 'action',
-              action: {
-                type: 'message',
-                label: item.label,
-                text: item.text
-              }
-            }))
-          }
-        }]
-      });
-    } catch (error) {
-      console.error('Push message with quick reply error:', error);
-    }
-  }
 
   private async replyFlexMessage(replyToken: string, altText: string, flexContent: any): Promise<void> {
     try {
@@ -2181,14 +2161,6 @@ export class BudgetBot {
       // Flex Messageで予算状況を表示
       const flexContent = await this.createBudgetProgressCard(stats, userId);
       await this.pushFlexMessage(userId, '更新された予算状況', flexContent);
-
-      const quickReplyItems = [
-        { label: '📊 予算確認', text: '予算確認' },
-        { label: '📝 履歴確認', text: '履歴' },
-        { label: '💰 予算設定', text: '予算設定' }
-      ];
-
-      await this.pushMessageWithQuickReply(userId, '次の操作を選択してください', quickReplyItems);
     } catch (error) {
       console.error('Add expense with push error:', error);
       await this.pushMessage(userId, '❌ 支出の記録中にエラーが発生しました。');

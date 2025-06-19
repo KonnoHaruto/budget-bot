@@ -91,9 +91,12 @@ async function handleEvent(event: line.WebhookEvent): Promise<void> {
 const client = new line.messagingApi.MessagingApiClient(config);
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`🚀 Budget Bot server running on port ${PORT}`);
   console.log(`📊 Health check: http://localhost:${PORT}/health`);
+  
+  // リッチメニューを初期化
+  await budgetBot.initializeRichMenu();
   
   // スケジューラーを開始
   schedulerService.start();
