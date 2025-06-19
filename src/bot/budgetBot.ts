@@ -27,18 +27,12 @@ interface PendingEdit {
   timestamp: number;
 }
 
-interface PendingDelete {
-  userId: string;
-  transactionId: number;
-  timestamp: number;
-}
 
 export class BudgetBot {
   private client: line.messagingApi.MessagingApiClient;
   private blobClient: line.messagingApi.MessagingApiBlobClient;
   private pendingTransactions: Map<string, PendingTransaction> = new Map();
   private pendingEdits: Map<string, PendingEdit> = new Map();
-  private pendingDeletes: Map<string, PendingDelete> = new Map();
 
   constructor() {
     const config = {
@@ -106,28 +100,16 @@ export class BudgetBot {
       }
     } else if (data === 'receipt_edit') {
       await this.handleReceiptEdit(replyToken, userId);
+    } else if (data.startsWith('start_edit_')) {
+      const transactionId = parseInt(data.replace('start_edit_', ''));
+      await this.handleStartEdit(replyToken, userId, transactionId);
+    } else if (data === 'cancel_edit' || data === 'cancel_delete') {
+      await this.replyMessage(replyToken, '❌ 操作をキャンセルしました。');
     }
   }
 
   private async handleTextMessage(replyToken: string, userId: string, text: string): Promise<void> {
     const command = text.toLowerCase().trim();
-
-    // 削除待機状態のチェック
-    const pendingDelete = this.pendingDeletes.get(userId);
-    if (pendingDelete) {
-      if (command === 'はい' || command === 'yes' || command === '削除' || command === 'ok') {
-        await this.handleDirectDeleteConfirm(replyToken, userId, pendingDelete.transactionId);
-        this.pendingDeletes.delete(userId);
-        return;
-      } else if (command === 'いいえ' || command === 'no' || command === 'キャンセル' || command === 'cancel') {
-        await this.replyMessage(replyToken, '❌ 削除をキャンセルしました。');
-        this.pendingDeletes.delete(userId);
-        return;
-      } else {
-        await this.replyMessage(replyToken, '❌ "はい" または "いいえ" で答えてください。');
-        return;
-      }
-    }
 
     // 編集待機状態のチェック
     const pendingEdit = this.pendingEdits.get(userId);
@@ -850,6 +832,262 @@ export class BudgetBot {
                 }
               }
             ]
+          }
+        ],
+        paddingAll: 'lg'
+      }
+    };
+  }
+
+  private createTransactionEditCard(transaction: Transaction): any {
+    return {
+      type: 'bubble',
+      size: 'kilo',
+      header: {
+        type: 'box',
+        layout: 'vertical',
+        contents: [
+          {
+            type: 'text',
+            text: '✏️ 取引編集',
+            weight: 'bold',
+            color: '#ffffff',
+            size: 'lg',
+            align: 'center'
+          },
+          {
+            type: 'text',
+            text: `¥${transaction.amount.toLocaleString()}`,
+            weight: 'bold',
+            color: '#ffffff',
+            size: 'xl',
+            align: 'center'
+          },
+          {
+            type: 'text',
+            text: '現在の金額',
+            color: '#ffffff',
+            size: 'xs',
+            align: 'center'
+          }
+        ],
+        backgroundColor: '#06C755',
+        paddingAll: 'lg'
+      },
+      body: {
+        type: 'box',
+        layout: 'vertical',
+        contents: [
+          {
+            type: 'box',
+            layout: 'baseline',
+            spacing: 'sm',
+            contents: [
+              {
+                type: 'text',
+                text: '内容',
+                color: '#aaaaaa',
+                size: 'sm',
+                flex: 2
+              },
+              {
+                type: 'text',
+                text: transaction.description || '（説明なし）',
+                wrap: true,
+                color: '#666666',
+                size: 'sm',
+                flex: 3,
+                weight: 'bold'
+              }
+            ]
+          },
+          {
+            type: 'box',
+            layout: 'baseline',
+            spacing: 'sm',
+            contents: [
+              {
+                type: 'text',
+                text: '日時',
+                color: '#aaaaaa',
+                size: 'sm',
+                flex: 2
+              },
+              {
+                type: 'text',
+                text: new Date(transaction.createdAt).toLocaleString('ja-JP'),
+                wrap: true,
+                color: '#666666',
+                size: 'sm',
+                flex: 3
+              }
+            ],
+            margin: 'sm'
+          },
+          {
+            type: 'text',
+            text: '新しい金額を入力してください',
+            color: '#666666',
+            size: 'sm',
+            align: 'center',
+            margin: 'lg'
+          }
+        ],
+        paddingAll: 'lg'
+      },
+      footer: {
+        type: 'box',
+        layout: 'vertical',
+        spacing: 'sm',
+        contents: [
+          {
+            type: 'button',
+            style: 'primary',
+            height: 'sm',
+            color: '#06C755',
+            action: {
+              type: 'postback',
+              label: '✏️ 金額を入力する',
+              data: `start_edit_${transaction.id}`
+            }
+          },
+          {
+            type: 'button',
+            style: 'secondary',
+            height: 'sm',
+            action: {
+              type: 'postback',
+              label: '❌ キャンセル',
+              data: 'cancel_edit'
+            }
+          }
+        ],
+        paddingAll: 'lg'
+      }
+    };
+  }
+
+  private createTransactionDeleteCard(transaction: Transaction): any {
+    return {
+      type: 'bubble',
+      size: 'kilo',
+      header: {
+        type: 'box',
+        layout: 'vertical',
+        contents: [
+          {
+            type: 'text',
+            text: '🗑️ 取引削除確認',
+            weight: 'bold',
+            color: '#ffffff',
+            size: 'lg',
+            align: 'center'
+          },
+          {
+            type: 'text',
+            text: `¥${transaction.amount.toLocaleString()}`,
+            weight: 'bold',
+            color: '#ffffff',
+            size: 'xl',
+            align: 'center'
+          },
+          {
+            type: 'text',
+            text: '削除する金額',
+            color: '#ffffff',
+            size: 'xs',
+            align: 'center'
+          }
+        ],
+        backgroundColor: '#FF334B',
+        paddingAll: 'lg'
+      },
+      body: {
+        type: 'box',
+        layout: 'vertical',
+        contents: [
+          {
+            type: 'box',
+            layout: 'baseline',
+            spacing: 'sm',
+            contents: [
+              {
+                type: 'text',
+                text: '内容',
+                color: '#aaaaaa',
+                size: 'sm',
+                flex: 2
+              },
+              {
+                type: 'text',
+                text: transaction.description || '（説明なし）',
+                wrap: true,
+                color: '#666666',
+                size: 'sm',
+                flex: 3,
+                weight: 'bold'
+              }
+            ]
+          },
+          {
+            type: 'box',
+            layout: 'baseline',
+            spacing: 'sm',
+            contents: [
+              {
+                type: 'text',
+                text: '日時',
+                color: '#aaaaaa',
+                size: 'sm',
+                flex: 2
+              },
+              {
+                type: 'text',
+                text: new Date(transaction.createdAt).toLocaleString('ja-JP'),
+                wrap: true,
+                color: '#666666',
+                size: 'sm',
+                flex: 3
+              }
+            ],
+            margin: 'sm'
+          },
+          {
+            type: 'text',
+            text: 'この取引を削除しますか？',
+            color: '#666666',
+            size: 'sm',
+            align: 'center',
+            margin: 'lg'
+          }
+        ],
+        paddingAll: 'lg'
+      },
+      footer: {
+        type: 'box',
+        layout: 'vertical',
+        spacing: 'sm',
+        contents: [
+          {
+            type: 'button',
+            style: 'primary',
+            height: 'sm',
+            color: '#FF334B',
+            action: {
+              type: 'postback',
+              label: '🗑️ 削除する',
+              data: `confirm_delete_${transaction.id}`
+            }
+          },
+          {
+            type: 'button',
+            style: 'secondary',
+            height: 'sm',
+            action: {
+              type: 'postback',
+              label: '❌ キャンセル',
+              data: 'cancel_delete'
+            }
           }
         ],
         paddingAll: 'lg'
@@ -1682,6 +1920,25 @@ export class BudgetBot {
     });
   }
 
+  private async handleStartEdit(replyToken: string, userId: string, transactionId: number): Promise<void> {
+    try {
+      // 編集待機状態を設定
+      this.pendingEdits.set(userId, {
+        userId,
+        transactionId,
+        timestamp: Date.now()
+      });
+
+      await this.replyMessage(replyToken, 
+        `✏️ 新しい金額を入力してください\n\n` +
+        `例: "2500"`
+      );
+    } catch (error) {
+      console.error('Start edit error:', error);
+      await this.replyMessage(replyToken, '❌ 編集の準備中にエラーが発生しました。');
+    }
+  }
+
   private async handleReceiptAmountEdit(replyToken: string, userId: string, newAmount: number): Promise<void> {
     const pending = this.pendingTransactions.get(userId);
     
@@ -1796,20 +2053,8 @@ export class BudgetBot {
         return;
       }
 
-      // 編集待機状態を設定
-      this.pendingEdits.set(userId, {
-        userId,
-        transactionId: transactionIdNum,
-        timestamp: Date.now()
-      });
-
-      const message = `✏️ 取引の編集\n\n` +
-        `現在の金額: ${transaction.amount.toLocaleString()}円\n` +
-        `内容: ${transaction.description}\n\n` +
-        `新しい金額を入力してください。\n` +
-        `例: "2500"`;
-
-      await this.replyMessage(replyToken, message);
+      const editCard = this.createTransactionEditCard(transaction);
+      await this.replyFlexMessage(replyToken, '✏️ 取引編集', editCard);
     } catch (error) {
       console.error('Transaction edit error:', error);
       await this.replyMessage(replyToken, '❌ 取引編集の準備中にエラーが発生しました。');
@@ -1828,21 +2073,8 @@ export class BudgetBot {
         return;
       }
 
-      // 削除待機状態を設定
-      this.pendingDeletes.set(userId, {
-        userId,
-        transactionId: transactionIdNum,
-        timestamp: Date.now()
-      });
-
-      const confirmMessage = `🗑️ 取引の削除確認\n\n` +
-        `金額: ${transaction.amount.toLocaleString()}円\n` +
-        `内容: ${transaction.description}\n` +
-        `日時: ${new Date(transaction.createdAt).toLocaleString('ja-JP')}\n\n` +
-        `この取引を削除しますか？\n` +
-        `"はい" または "いいえ" で答えてください。`;
-
-      await this.replyMessage(replyToken, confirmMessage);
+      const deleteCard = this.createTransactionDeleteCard(transaction);
+      await this.replyFlexMessage(replyToken, '🗑️ 取引削除確認', deleteCard);
     } catch (error) {
       console.error('Transaction delete error:', error);
       await this.replyMessage(replyToken, '❌ 取引削除の準備中にエラーが発生しました。');
@@ -1881,30 +2113,6 @@ export class BudgetBot {
     }
   }
 
-  private async handleDirectDeleteConfirm(replyToken: string, userId: string, transactionId: number): Promise<void> {
-    try {
-      const result = await databaseService.deleteTransaction(userId, transactionId);
-      
-      const message = `✅ 取引を削除しました\n\n` +
-        `削除された金額: ${result.deletedAmount.toLocaleString()}円`;
-
-      await this.replyMessage(replyToken, message);
-
-      // 更新された予算状況を表示
-      const stats = await databaseService.getUserStats(userId);
-      if (stats) {
-        const flexContent = await this.createBudgetProgressCard(stats, userId);
-        await this.pushFlexMessage(userId, '更新された予算状況', flexContent);
-      }
-    } catch (error) {
-      console.error('Direct delete error:', error);
-      if (error instanceof Error && error.message === 'Transaction not found') {
-        await this.replyMessage(replyToken, '❌ 指定された取引が見つかりません。');
-      } else {
-        await this.replyMessage(replyToken, '❌ 取引の削除中にエラーが発生しました。');
-      }
-    }
-  }
 
   private async handleEditCommand(replyToken: string, userId: string, text: string): Promise<void> {
     try {
