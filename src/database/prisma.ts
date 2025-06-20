@@ -5,6 +5,51 @@ const prisma = new PrismaClient();
 export default prisma;
 
 export class DatabaseService {
+  // Exchange Rate management
+  async saveExchangeRate(fromCurrency: string, toCurrency: string = 'JPY', rate: number) {
+    return await prisma.exchangeRate.upsert({
+      where: {
+        fromCurrency_toCurrency: {
+          fromCurrency,
+          toCurrency
+        }
+      },
+      update: {
+        rate,
+        fetchedAt: new Date()
+      },
+      create: {
+        fromCurrency,
+        toCurrency,
+        rate,
+        fetchedAt: new Date()
+      }
+    });
+  }
+
+  async getExchangeRate(fromCurrency: string, toCurrency: string = 'JPY') {
+    return await prisma.exchangeRate.findUnique({
+      where: {
+        fromCurrency_toCurrency: {
+          fromCurrency,
+          toCurrency
+        }
+      }
+    });
+  }
+
+  async getAllExchangeRates() {
+    return await prisma.exchangeRate.findMany({
+      orderBy: { fetchedAt: 'desc' }
+    });
+  }
+
+  async getLatestRateUpdate() {
+    const latestRate = await prisma.exchangeRate.findFirst({
+      orderBy: { fetchedAt: 'desc' }
+    });
+    return latestRate?.fetchedAt || null;
+  }
   async getUser(lineUserId: string) {
     return await prisma.user.findUnique({
       where: { lineUserId },

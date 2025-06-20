@@ -18,6 +18,8 @@ export interface ExchangeRateResponse {
   date: string;
 }
 
+import { exchangeRateUpdateService } from './exchangeRateUpdateService';
+
 export class CurrencyService {
   private static readonly CURRENCIES: CurrencyInfo[] = [
     // 日本
@@ -95,27 +97,27 @@ export class CurrencyService {
   }
 
   /**
-   * リアルタイム為替レートを取得
+   * キャッシュされた為替レートを取得（1日3回更新）
    */
   static async getExchangeRate(fromCurrency: string, toCurrency: string = 'JPY'): Promise<number> {
     if (fromCurrency === toCurrency) return 1;
     
     try {
-      // 為替レートAPI (ExchangeRate-API) を使用
-      const url = `https://api.exchangerate-api.com/v4/latest/${fromCurrency}`;
+      // キャッシュされたレートを取得
+      const cachedRate = await exchangeRateUpdateService.getCachedExchangeRate(fromCurrency, toCurrency);
       
-      const response = await fetch(url);
-      const data = await response.json() as ExchangeRateResponse;
-      
-      if (data.rates && data.rates[toCurrency]) {
-        return data.rates[toCurrency];
+      if (cachedRate !== null) {
+        return cachedRate;
       }
       
-      throw new Error(`Exchange rate not found for ${fromCurrency} to ${toCurrency}`);
-    } catch (error) {
-      console.error('Exchange rate API error:', error);
+      console.log(`📊 No cached rate found for ${fromCurrency}/${toCurrency}, using fallback`);
       
-      // フォールバック: 固定レーと（2024年度）
+      // キャッシュされたレートがない場合はフォールバック
+      return this.getFallbackRate(fromCurrency, toCurrency);
+    } catch (error) {
+      console.error('Cached exchange rate error:', error);
+      
+      // エラーの場合もフォールバック
       return this.getFallbackRate(fromCurrency, toCurrency);
     }
   }

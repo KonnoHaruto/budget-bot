@@ -38,3 +38,15 @@ model Transaction {
   
   @@map("transactions")
 }
+
+model ExchangeRate {
+  id           Int      @id @default(autoincrement())
+  fromCurrency String   @map("from_currency")
+  toCurrency   String   @map("to_currency") @default("JPY")
+  rate         Float
+  fetchedAt    DateTime @map("fetched_at")
+  createdAt    DateTime @default(now()) @map("created_at")
+  
+  @@unique([fromCurrency, toCurrency])
+  @@map("exchange_rates")
+}

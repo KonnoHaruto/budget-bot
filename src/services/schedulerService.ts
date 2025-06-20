@@ -1,5 +1,6 @@
 import { BudgetBot } from '../bot/budgetBot';
 import { databaseService } from '../database/prisma';
+import { exchangeRateUpdateService } from './exchangeRateUpdateService';
 
 export class SchedulerService {
   private budgetBot: BudgetBot;
@@ -16,9 +17,14 @@ export class SchedulerService {
     // 1分ごとにチェック（実際の運用では5分間隔でも十分）
     this.intervalId = setInterval(() => {
       this.checkAndSendWeeklyReport();
+      this.checkAndUpdateExchangeRates();
     }, 60 * 1000); // 1分間隔
 
     console.log('📅 Scheduler started - Weekly reports will be sent every Monday at 6:00 AM JST');
+    console.log('💱 Exchange rate updates will run 3 times per day (6:00, 12:00, 18:00 JST)');
+    
+    // 起動時に初回レート更新を実行
+    this.performInitialExchangeRateUpdate();
   }
 
   // 停止
@@ -182,6 +188,41 @@ export class SchedulerService {
   async sendTestWeeklyReport(userId: string): Promise<void> {
     console.log(`📧 Sending test weekly report to user: ${userId}`);
     await this.sendWeeklyReportToUser(userId);
+  }
+
+  // 為替レート更新チェック
+  private async checkAndUpdateExchangeRates(): Promise<void> {
+    try {
+      const now = new Date();
+      const jstOffset = 9 * 60 * 60 * 1000; // JST offset
+      const jstNow = new Date(now.getTime() + jstOffset);
+
+      const hour = jstNow.getHours();
+      const minute = jstNow.getMinutes();
+
+      // 6:00, 12:00, 18:00 の各時刻の00-05分の間に実行
+      const targetHours = [6, 12, 18];
+      if (targetHours.includes(hour) && minute < 5) {
+        console.log(`💱 Updating exchange rates at ${hour}:${minute.toString().padStart(2, '0')} JST`);
+        await exchangeRateUpdateService.updateAllExchangeRates();
+      }
+    } catch (error) {
+      console.error('❌ Error in exchange rate update scheduler:', error);
+    }
+  }
+
+  // 起動時の初回レート更新
+  private async performInitialExchangeRateUpdate(): Promise<void> {
+    try {
+      console.log('🚀 Performing initial exchange rate update check...');
+      const shouldUpdate = await exchangeRateUpdateService.shouldUpdateRates();
+      
+      if (shouldUpdate) {
+        await exchangeRateUpdateService.updateAllExchangeRates();
+      }
+    } catch (error) {
+      console.error('❌ Error in initial exchange rate update:', error);
+    }
   }
 }
 
