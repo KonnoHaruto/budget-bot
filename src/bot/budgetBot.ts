@@ -48,6 +48,18 @@ interface EditRequest {
   timestamp: number;
 }
 
+interface ExpenseConfirmRequest {
+  userId: string;
+  token: string;
+  timestamp: number;
+}
+
+interface ResetConfirmRequest {
+  userId: string;
+  token: string;
+  timestamp: number;
+}
+
 
 export class BudgetBot {
   private client: line.messagingApi.MessagingApiClient;
@@ -58,6 +70,8 @@ export class BudgetBot {
   private pendingBudgetSets: Map<string, PendingBudgetSet> = new Map();
   private deleteRequests: Map<string, DeleteRequest> = new Map();
   private editRequests: Map<string, EditRequest> = new Map();
+  private expenseConfirmRequests: Map<string, ExpenseConfirmRequest> = new Map();
+  private resetConfirmRequests: Map<string, ResetConfirmRequest> = new Map();
 
   constructor() {
     const config = {
@@ -97,6 +111,20 @@ export class BudgetBot {
     for (const [token, request] of this.editRequests.entries()) {
       if (now - request.timestamp > EXPIRY_TIME) {
         this.editRequests.delete(token);
+      }
+    }
+
+    // 支出確認リクエストのクリーンアップ
+    for (const [token, request] of this.expenseConfirmRequests.entries()) {
+      if (now - request.timestamp > EXPIRY_TIME) {
+        this.expenseConfirmRequests.delete(token);
+      }
+    }
+
+    // リセット確認リクエストのクリーンアップ
+    for (const [token, request] of this.resetConfirmRequests.entries()) {
+      if (now - request.timestamp > EXPIRY_TIME) {
+        this.resetConfirmRequests.delete(token);
       }
     }
   }
@@ -145,19 +173,18 @@ export class BudgetBot {
     } else if (data.startsWith('cancel_edit_')) {
       const token = data.replace('cancel_edit_', '');
       await this.handleEditCancel(replyToken, token);
-    } else if (data.startsWith('confirm_edit_old_')) {
-      const parts = data.replace('confirm_edit_old_', '').split('_');
-      if (parts.length === 2) {
-        const transactionId = parseInt(parts[0]);
-        const newAmount = parseInt(parts[1]);
-        await this.handleConfirmEdit(replyToken, userId, transactionId, newAmount);
-      }
     } else if (data.startsWith('confirm_reset_')) {
-      const confirmed = data === 'confirm_reset_yes';
-      await this.handleResetConfirmation(replyToken, userId, confirmed);
-    } else if (data.startsWith('confirm_')) {
-      const confirmed = data === 'confirm_yes';
-      await this.handleConfirmation(replyToken, userId, confirmed);
+      const token = data.replace('confirm_reset_', '');
+      await this.handleResetConfirm(replyToken, userId, token);
+    } else if (data.startsWith('cancel_reset_')) {
+      const token = data.replace('cancel_reset_', '');
+      await this.handleResetCancel(replyToken, token);
+    } else if (data.startsWith('confirm_expense_')) {
+      const token = data.replace('confirm_expense_', '');
+      await this.handleExpenseConfirm(replyToken, userId, token);
+    } else if (data.startsWith('cancel_expense_')) {
+      const token = data.replace('cancel_expense_', '');
+      await this.handleExpenseCancel(replyToken, token);
     } else if (data.startsWith('menu_')) {
       await this.handleMenuAction(replyToken, userId, data);
     } else if (data.startsWith('edit_transaction_')) {
@@ -238,7 +265,7 @@ export class BudgetBot {
       // Try to parse as manual expense entry
       const amount = this.parseAmount(text);
       if (amount > 0) {
-        await this.addExpense(replyToken, userId, amount, `手動入力: ${text}`);
+        await this.handleManualExpenseConfirmation(replyToken, userId, amount, `手動入力: ${text}`);
       } else {
         await this.handleHelp(replyToken);
       }
@@ -249,6 +276,10 @@ export class BudgetBot {
     let hasReplied = false;
     
     try {
+      // Send processing started message immediately
+      await this.replyMessage(replyToken, '処理を開始しました。');
+      hasReplied = true;
+
       // Get image content from LINE
       const stream = await this.blobClient.getMessageContent(messageId);
       
@@ -268,14 +299,6 @@ export class BudgetBot {
       const receiptInfo = ocrService.parseReceiptInfo(extractedText);
 
       if (receiptInfo.amounts && receiptInfo.amounts.length > 0) {
-        // 外貨の場合は為替レート確認中メッセージを送信
-        const hasNonJPY = receiptInfo.amounts.some(amount => 
-          CurrencyService.isNonJPYCurrency(amount.currency.code)
-        );
-        
-        if (hasNonJPY) {
-          await this.pushMessage(userId, '💱 為替レート確認中...');
-        }
         
         // 為替変換を実行
         await this.processReceiptAmounts(userId, receiptInfo.amounts, receiptInfo.storeName);
@@ -453,6 +476,15 @@ export class BudgetBot {
   }
 
   private async handleBudgetReset(replyToken: string, userId: string): Promise<void> {
+    this.cleanupExpiredTokens();
+    
+    const token = this.generateDeleteToken();
+    this.resetConfirmRequests.set(token, {
+      userId,
+      token,
+      timestamp: Date.now()
+    });
+
     // リセット警告メッセージを表示
     const warningMessage = '⚠️ 重要な警告\n\n' +
       'すべての取引データが完全に削除されます。\n' +
@@ -460,8 +492,8 @@ export class BudgetBot {
       '本当にリセットしますか？';
 
     const actions = [
-      { label: '✅ リセット実行', data: 'confirm_reset_yes' },
-      { label: '❌ キャンセル', data: 'confirm_reset_no' }
+      { label: '✅ リセット実行', data: `confirm_reset_${token}` },
+      { label: '❌ キャンセル', data: `cancel_reset_${token}` }
     ];
 
     await this.pushButtonsMessage(userId, 'データリセット確認', warningMessage, actions);
@@ -1015,7 +1047,8 @@ export class BudgetBot {
     originalAmount?: number, 
     currency?: string, 
     rate?: number, 
-    storeName?: string
+    storeName?: string,
+    token?: string
   ): any {
     const displayAmount = originalAmount || amount;
     const displayCurrency = currency || 'JPY';
@@ -1164,8 +1197,8 @@ export class BudgetBot {
             color: '#06C755',
             action: {
               type: 'postback',
-              label: '✅ 記録する',
-              data: 'confirm_yes'
+              label: '記録する',
+              data: token ? `confirm_expense_${token}` : 'confirm_yes'
             }
           },
           {
@@ -1192,7 +1225,7 @@ export class BudgetBot {
                 action: {
                   type: 'postback',
                   label: '❌ キャンセル',
-                  data: 'confirm_no'
+                  data: token ? `cancel_expense_${token}` : 'confirm_no'
                 }
               }
             ]
@@ -2291,6 +2324,15 @@ export class BudgetBot {
       // 変換後の金額を追加
       mainAmount.convertedAmount = conversionResult.convertedAmount;
       
+      // ワンタイムトークン生成
+      this.cleanupExpiredTokens();
+      const token = this.generateDeleteToken();
+      this.expenseConfirmRequests.set(token, {
+        userId,
+        token,
+        timestamp: Date.now()
+      });
+
       // 保留中取引として保存
       this.pendingTransactions.set(userId, {
         userId,
@@ -2306,7 +2348,8 @@ export class BudgetBot {
         mainAmount.currency.code !== 'JPY' ? mainAmount.amount : undefined,
         mainAmount.currency.code !== 'JPY' ? mainAmount.currency.code : undefined,
         mainAmount.currency.code !== 'JPY' ? conversionResult.rate : undefined,
-        storeName || undefined
+        storeName || undefined,
+        token
       );
       
       console.log('📤 About to send confirmation flex message...');
@@ -2431,13 +2474,23 @@ export class BudgetBot {
         await this.replyMessage(replyToken, `✅ 金額を ¥${newAmount.toLocaleString()} に変更しました。`);
       }
       
+      // ワンタイムトークン生成（編集後の確認用）
+      this.cleanupExpiredTokens();
+      const token = this.generateDeleteToken();
+      this.expenseConfirmRequests.set(token, {
+        userId,
+        token,
+        timestamp: Date.now()
+      });
+
       // 更新されたレシート確認カードを再送信
       const confirmationCard = this.createReceiptConfirmationCard(
         convertedAmount,
         originalCurrency !== 'JPY' ? newAmount : undefined,
         originalCurrency !== 'JPY' ? originalCurrency : undefined,
         rate,
-        pending.storeName || undefined
+        pending.storeName || undefined,
+        token
       );
       
       await this.pushFlexMessage(userId, '💰 支出確認（編集済み）', confirmationCard);
@@ -2783,6 +2836,139 @@ export class BudgetBot {
     } catch (error) {
       console.error('Edit cancel error:', error);
       await this.replyMessage(replyToken, '❌ キャンセル処理中にエラーが発生しました。');
+    }
+  }
+
+  private async handleExpenseConfirm(replyToken: string, userId: string, token: string): Promise<void> {
+    try {
+      this.cleanupExpiredTokens();
+      
+      const expenseRequest = this.expenseConfirmRequests.get(token);
+      if (!expenseRequest || expenseRequest.userId !== userId) {
+        await this.replyMessage(replyToken, '❌ 確認リクエストが無効または期限切れです。');
+        console.log(`🔒 Invalid or expired expense confirm token: ${token}`);
+        return;
+      }
+
+      // トークンを失効（ワンタイム使用）
+      this.expenseConfirmRequests.delete(token);
+      console.log(`🔐 Expense confirm token consumed: ${token}`);
+
+      // 旧来のconfirmation処理を呼び出し
+      await this.handleConfirmation(replyToken, userId, true);
+    } catch (error) {
+      console.error('Expense confirm error:', error);
+      await this.replyMessage(replyToken, '❌ 確認処理中にエラーが発生しました。');
+    }
+  }
+
+  private async handleExpenseCancel(replyToken: string, token: string): Promise<void> {
+    try {
+      this.cleanupExpiredTokens();
+      
+      const expenseRequest = this.expenseConfirmRequests.get(token);
+      if (!expenseRequest) {
+        await this.replyMessage(replyToken, '❌ キャンセルリクエストが無効または期限切れです。');
+        console.log(`🔒 Invalid or expired expense cancel token: ${token}`);
+        return;
+      }
+
+      // トークンを失効
+      this.expenseConfirmRequests.delete(token);
+      console.log(`🔐 Expense cancel token consumed: ${token}`);
+
+      // 旧来のconfirmation処理を呼び出し
+      await this.handleConfirmation(replyToken, expenseRequest.userId, false);
+    } catch (error) {
+      console.error('Expense cancel error:', error);
+      await this.replyMessage(replyToken, '❌ キャンセル処理中にエラーが発生しました。');
+    }
+  }
+
+  private async handleResetConfirm(replyToken: string, userId: string, token: string): Promise<void> {
+    try {
+      this.cleanupExpiredTokens();
+      
+      const resetRequest = this.resetConfirmRequests.get(token);
+      if (!resetRequest || resetRequest.userId !== userId) {
+        await this.replyMessage(replyToken, '❌ リセット確認が無効または期限切れです。');
+        console.log(`🔒 Invalid or expired reset confirm token: ${token}`);
+        return;
+      }
+
+      // トークンを失効（ワンタイム使用）
+      this.resetConfirmRequests.delete(token);
+      console.log(`🔐 Reset confirm token consumed: ${token}`);
+
+      // 旧来のreset confirmation処理を呼び出し
+      await this.handleResetConfirmation(replyToken, userId, true);
+    } catch (error) {
+      console.error('Reset confirm error:', error);
+      await this.replyMessage(replyToken, '❌ リセット確認処理中にエラーが発生しました。');
+    }
+  }
+
+  private async handleResetCancel(replyToken: string, token: string): Promise<void> {
+    try {
+      this.cleanupExpiredTokens();
+      
+      const resetRequest = this.resetConfirmRequests.get(token);
+      if (!resetRequest) {
+        await this.replyMessage(replyToken, '❌ キャンセルリクエストが無効または期限切れです。');
+        console.log(`🔒 Invalid or expired reset cancel token: ${token}`);
+        return;
+      }
+
+      // トークンを失効
+      this.resetConfirmRequests.delete(token);
+      console.log(`🔐 Reset cancel token consumed: ${token}`);
+
+      // 旧来のreset confirmation処理を呼び出し
+      await this.handleResetConfirmation(replyToken, resetRequest.userId, false);
+    } catch (error) {
+      console.error('Reset cancel error:', error);
+      await this.replyMessage(replyToken, '❌ キャンセル処理中にエラーが発生しました。');
+    }
+  }
+
+  private async handleManualExpenseConfirmation(replyToken: string, userId: string, amount: number, description: string): Promise<void> {
+    try {
+      // ワンタイムトークン生成
+      this.cleanupExpiredTokens();
+      const token = this.generateDeleteToken();
+      this.expenseConfirmRequests.set(token, {
+        userId,
+        token,
+        timestamp: Date.now()
+      });
+
+      // 保留中取引として保存
+      this.pendingTransactions.set(userId, {
+        userId,
+        parsedAmounts: [{
+          amount,
+          currency: { code: 'JPY', symbol: '¥', name: '日本円' },
+          originalText: description,
+          convertedAmount: amount
+        }],
+        storeName: null,
+        timestamp: Date.now()
+      });
+
+      // 確認画面を送信
+      const confirmationCard = this.createReceiptConfirmationCard(
+        amount,
+        undefined,
+        undefined,
+        undefined,
+        description,
+        token
+      );
+
+      await this.replyFlexMessage(replyToken, '💰 支出確認', confirmationCard);
+    } catch (error) {
+      console.error('Manual expense confirmation error:', error);
+      await this.replyMessage(replyToken, '❌ 支出確認の準備中にエラーが発生しました。');
     }
   }
 }
