@@ -523,6 +523,10 @@ export class BudgetBot {
 
   private async handleHistory(replyToken: string, userId: string): Promise<void> {
     try {
+      // ローディングメッセージを先に送信
+      await this.pushMessage(userId, '📝 履歴を読み込んでいます...');
+      await this.showLoadingAnimation(userId);
+      
       const transactions = await databaseService.getRecentTransactions(userId, 10);
       
       if (transactions.length === 0) {
@@ -532,7 +536,7 @@ export class BudgetBot {
 
       // Flex Messageで取引一覧を表示
       const flexContent = this.createTransactionListCard(transactions);
-      await this.replyFlexMessage(replyToken, '取引履歴', flexContent);
+      await this.replyFlexMessage(replyToken, '📋 取引履歴', flexContent);
     } catch (error) {
       console.error('Transaction history error:', error);
       await this.replyMessage(replyToken, '❌ 履歴の取得中にエラーが発生しました。');
@@ -735,6 +739,10 @@ export class BudgetBot {
 
   private async handleTodayBalance(replyToken: string, userId: string): Promise<void> {
     try {
+      // ローディングメッセージを先に送信
+      await this.pushMessage(userId, '📊 残高情報を取得しています...');
+      await this.showLoadingAnimation(userId);
+      
       const stats = await databaseService.getUserStats(userId);
       if (!stats) {
         await this.replyMessage(replyToken, '❌ ユーザー情報が見つかりません。まず予算を設定してください。');
@@ -2552,6 +2560,9 @@ export class BudgetBot {
 
   private async handleTransactionEdit(replyToken: string, userId: string, transactionId: string): Promise<void> {
     try {
+      // ローディングメッセージを先に送信
+      await this.pushMessage(userId, '✏️ 取引情報を取得しています...');
+      
       // 取引情報を取得して表示
       const transactions = await databaseService.getRecentTransactions(userId, 50);
       const transactionIdNum = parseInt(transactionId);
@@ -2579,6 +2590,9 @@ export class BudgetBot {
 
   private async handleTransactionDelete(replyToken: string, userId: string, transactionId: string): Promise<void> {
     try {
+      // ローディングメッセージを先に送信
+      await this.pushMessage(userId, '🗑️ 取引情報を確認しています...');
+      
       // 期限切れトークンをクリーンアップ
       this.cleanupExpiredTokens();
       
