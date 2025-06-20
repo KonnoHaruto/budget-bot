@@ -1,7 +1,7 @@
 # TODO
 
 [] rich menuを考える
-[] flex messageのindicatorを外部APIを用いてスタイリッシュにする
+[x] flex messageのindicatorを外部APIを用いてスタイリッシュにする
 
 [] 時間がかかる処理を挟む場合、ユーザーに処理中であることを伝えるメッセージを先に送信する。
 
@@ -15,3 +15,6 @@
 
 [x] budgetBot.tsのエラーを解消
 
+[] 額がオーバーした場合のdaily budgetのflex messageをわかりやすい形で変更
+
+[] 欲しいものが見つかった時に、AIに相談する機能を実装

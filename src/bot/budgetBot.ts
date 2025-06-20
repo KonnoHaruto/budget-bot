@@ -28,6 +28,26 @@ interface PendingEdit {
   timestamp: number;
 }
 
+interface PendingBudgetSet {
+  userId: string;
+  timestamp: number;
+}
+
+interface DeleteRequest {
+  userId: string;
+  transactionId: number;
+  token: string;
+  timestamp: number;
+}
+
+interface EditRequest {
+  userId: string;
+  transactionId: number;
+  newAmount: number;
+  token: string;
+  timestamp: number;
+}
+
 
 export class BudgetBot {
   private client: line.messagingApi.MessagingApiClient;
@@ -35,6 +55,9 @@ export class BudgetBot {
   private richMenuService: RichMenuService;
   private pendingTransactions: Map<string, PendingTransaction> = new Map();
   private pendingEdits: Map<string, PendingEdit> = new Map();
+  private pendingBudgetSets: Map<string, PendingBudgetSet> = new Map();
+  private deleteRequests: Map<string, DeleteRequest> = new Map();
+  private editRequests: Map<string, EditRequest> = new Map();
 
   constructor() {
     const config = {
@@ -52,6 +75,29 @@ export class BudgetBot {
       console.log('🎉 Rich menu initialized successfully');
     } catch (error) {
       console.error('❌ Rich menu initialization failed:', error);
+    }
+  }
+
+  private generateDeleteToken(): string {
+    return Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
+  }
+
+  private cleanupExpiredTokens(): void {
+    const now = Date.now();
+    const EXPIRY_TIME = 5 * 60 * 1000; // 5分
+
+    // 削除リクエストのクリーンアップ
+    for (const [token, request] of this.deleteRequests.entries()) {
+      if (now - request.timestamp > EXPIRY_TIME) {
+        this.deleteRequests.delete(token);
+      }
+    }
+
+    // 編集リクエストのクリーンアップ
+    for (const [token, request] of this.editRequests.entries()) {
+      if (now - request.timestamp > EXPIRY_TIME) {
+        this.editRequests.delete(token);
+      }
     }
   }
 
@@ -88,14 +134,19 @@ export class BudgetBot {
     const data = postback.data;
     
     if (data.startsWith('confirm_delete_')) {
-      if (data === 'confirm_delete_cancel') {
-        await this.replyMessage(replyToken, '❌ 削除をキャンセルしました。');
-      } else {
-        const transactionId = data.replace('confirm_delete_', '');
-        await this.handleTransactionDeleteConfirm(replyToken, userId, transactionId);
-      }
+      const token = data.replace('confirm_delete_', '');
+      await this.handleTransactionDeleteConfirm(replyToken, userId, token);
+    } else if (data.startsWith('cancel_delete_')) {
+      const token = data.replace('cancel_delete_', '');
+      await this.handleDeleteCancel(replyToken, token);
     } else if (data.startsWith('confirm_edit_')) {
-      const parts = data.replace('confirm_edit_', '').split('_');
+      const token = data.replace('confirm_edit_', '');
+      await this.handleEditConfirm(replyToken, userId, token);
+    } else if (data.startsWith('cancel_edit_')) {
+      const token = data.replace('cancel_edit_', '');
+      await this.handleEditCancel(replyToken, token);
+    } else if (data.startsWith('confirm_edit_old_')) {
+      const parts = data.replace('confirm_edit_old_', '').split('_');
       if (parts.length === 2) {
         const transactionId = parseInt(parts[0]);
         const newAmount = parseInt(parts[1]);
@@ -150,13 +201,11 @@ export class BudgetBot {
 
     // リッチメニューからのメッセージ処理
     if (command === '予算設定') {
-      await this.handleBudgetSetInstruction(replyToken);
-    } else if (command === '支出を記録') {
-      await this.handleManualExpenseEntry(replyToken);
-    } else if (command === 'レシート取込') {
-      await this.handleReceiptUploadInstruction(replyToken);
+      await this.handleBudgetSetInstruction(replyToken, userId);
     } else if (command === '今日の残高') {
       await this.handleTodayBalance(replyToken, userId);
+    } else if (command === '履歴') {
+      await this.handleHistory(replyToken, userId);
     } else if (command === 'レポート') {
       await this.handleReport(replyToken, userId);
     } else if (command === 'ヘルプ') {
@@ -165,14 +214,27 @@ export class BudgetBot {
       await this.handleBudgetSet(replyToken, userId, text);
     } else if (command === '予算確認' || command === 'budget' || command === 'status') {
       await this.handleBudgetStatus(replyToken, userId);
-    } else if (command === '履歴' || command === 'history') {
-      await this.handleTransactionHistory(replyToken, userId);
     } else if (command === 'リセット' || command === 'reset') {
       await this.handleBudgetReset(replyToken, userId);
     } else if (text.startsWith('edit ')) {
       // 取引編集コマンド: "edit transactionId newAmount"
       await this.handleEditCommand(replyToken, userId, text);
     } else {
+      // Check if user is in budget setting mode
+      const pendingBudget = this.pendingBudgetSets.get(userId);
+      if (pendingBudget && (Date.now() - pendingBudget.timestamp) < 300000) { // 5分以内
+        const amount = this.parseAmount(text);
+        if (amount > 0) {
+          // Process as budget setting
+          this.pendingBudgetSets.delete(userId);
+          await this.handleBudgetSet(replyToken, userId, amount.toString());
+          return;
+        } else {
+          await this.replyMessage(replyToken, '❌ 有効な金額を入力してください。数字のみで入力してください。\n例: 50000');
+          return;
+        }
+      }
+      
       // Try to parse as manual expense entry
       const amount = this.parseAmount(text);
       if (amount > 0) {
@@ -296,23 +358,6 @@ export class BudgetBot {
     }
   }
 
-  private async handleTransactionHistory(replyToken: string, userId: string): Promise<void> {
-    try {
-      const transactions = await databaseService.getRecentTransactions(userId, 10);
-      
-      if (transactions.length === 0) {
-        await this.replyMessage(replyToken, '📝 まだ支出の履歴がありません。');
-        return;
-      }
-
-      // Flex Messageで取引一覧を表示
-      const flexContent = this.createTransactionListCard(transactions);
-      await this.replyFlexMessage(replyToken, '取引履歴', flexContent);
-    } catch (error) {
-      console.error('Transaction history error:', error);
-      await this.replyMessage(replyToken, '❌ 履歴の取得中にエラーが発生しました。');
-    }
-  }
 
   private createTransactionListCard(transactions: Transaction[]): any {
     const bubbles = transactions.map((transaction: Transaction) => {
@@ -441,38 +486,217 @@ export class BudgetBot {
     }
   }
 
+  private async handleHistory(replyToken: string, userId: string): Promise<void> {
+    try {
+      const transactions = await databaseService.getRecentTransactions(userId, 10);
+      
+      if (transactions.length === 0) {
+        await this.replyMessage(replyToken, '📝 まだ支出の履歴がありません。');
+        return;
+      }
+
+      // Flex Messageで取引一覧を表示
+      const flexContent = this.createTransactionListCard(transactions);
+      await this.replyFlexMessage(replyToken, '取引履歴', flexContent);
+    } catch (error) {
+      console.error('Transaction history error:', error);
+      await this.replyMessage(replyToken, '❌ 履歴の取得中にエラーが発生しました。');
+    }
+  }
+
   private async handleHelp(replyToken: string): Promise<void> {
-    const helpMessage = `📖 予算管理ボットの使い方\n\n` +
-      `💰 予算設定: 月額予算を設定・変更\n` +
-      `📝 支出を記録: 金額とメモを手動入力\n` +
-      `📷 レシート取込: レシート写真から金額を自動抽出\n` +
-      `💵 今日の残高: 今日使える額と残り日数を表示\n` +
-      `📊 レポート: 週や月ごとの支出グラフを表示\n` +
-      `⚙️ 設定・ヘルプ: 各種設定とヘルプ参照\n\n` +
-      `💡 下のメニューからお選びください！`;
+    const helpCard = {
+      type: "bubble",
+      header: {
+        type: "box",
+        layout: "vertical",
+        contents: [
+          {
+            type: "text",
+            text: "予算管理ボットの使い方",
+            weight: "bold",
+            size: "xl",
+            color: "#ffffff",
+            align: "center"
+          }
+        ],
+        backgroundColor: "#2196F3",
+        paddingAll: "20px"
+      },
+      body: {
+        type: "box",
+        layout: "vertical",
+        contents: [
+          {
+            type: "text",
+            text: "各機能の説明",
+            weight: "bold",
+            size: "md",
+            color: "#333333",
+            margin: "md"
+          },
+          {
+            type: "separator",
+            margin: "lg"
+          },
+          {
+            type: "box",
+            layout: "vertical",
+            contents: [
+              {
+                type: "box",
+                layout: "horizontal",
+                contents: [
+                  {
+                    type: "text",
+                    text: "残高",
+                    weight: "bold",
+                    size: "sm",
+                    color: "#2196F3",
+                    flex: 3
+                  },
+                  {
+                    type: "text",
+                    text: "月の予算を設定するだけで、今日使える額、一週間で使える額、一ヶ月で使える残りの額に分けて表示",
+                    size: "sm",
+                    color: "#666666",
+                    flex: 7,
+                    wrap: true
+                  }
+                ],
+                margin: "lg"
+              },
+              {
+                type: "separator",
+                margin: "md"
+              },
+              {
+                type: "box",
+                layout: "horizontal",
+                contents: [
+                  {
+                    type: "text",
+                    text: "予算設定",
+                    weight: "bold",
+                    size: "sm",
+                    color: "#2196F3",
+                    flex: 3
+                  },
+                  {
+                    type: "text",
+                    text: "月額予算を設定・変更",
+                    size: "sm",
+                    color: "#666666",
+                    flex: 7,
+                    wrap: true
+                  }
+                ],
+                margin: "md"
+              },
+              {
+                type: "separator",
+                margin: "md"
+              },
+              {
+                type: "box",
+                layout: "horizontal",
+                contents: [
+                  {
+                    type: "text",
+                    text: "レポート",
+                    weight: "bold",
+                    size: "sm",
+                    color: "#2196F3",
+                    flex: 3
+                  },
+                  {
+                    type: "text",
+                    text: "週や月ごとの支出分析",
+                    size: "sm",
+                    color: "#666666",
+                    flex: 7,
+                    wrap: true
+                  }
+                ],
+                margin: "md"
+              }
+            ],
+            margin: "lg"
+          },
+          {
+            type: "separator",
+            margin: "xl"
+          },
+          {
+            type: "text",
+            text: "使用方法",
+            weight: "bold",
+            size: "md",
+            color: "#333333",
+            margin: "xl"
+          },
+          {
+            type: "box",
+            layout: "vertical",
+            contents: [
+              {
+                type: "text",
+                text: "1. 💰 支出の記録",
+                weight: "bold",
+                size: "sm",
+                color: "#333333",
+                margin: "lg"
+              },
+              {
+                type: "text",
+                text: "金額のみを入力して支出を記録できます（例: 2500）",
+                size: "sm",
+                color: "#666666",
+                wrap: true,
+                margin: "sm"
+              },
+              {
+                type: "text",
+                text: "2. 📷 レシート認識",
+                weight: "bold",
+                size: "sm",
+                color: "#333333",
+                margin: "md"
+              },
+              {
+                type: "text",
+                text: "レシートの写真を送信すると自動で金額を読み取ります",
+                size: "sm",
+                color: "#666666",
+                wrap: true,
+                margin: "sm"
+              },
+              {
+                type: "text",
+                text: "3. 📱 リッチメニュー",
+                weight: "bold",
+                size: "sm",
+                color: "#333333",
+                margin: "md"
+              },
+              {
+                type: "text",
+                text: "下部のメニューから各機能にアクセスできます",
+                size: "sm",
+                color: "#666666",
+                wrap: true,
+                margin: "sm"
+              }
+            ]
+          }
+        ],
+        paddingAll: "20px"
+      }
+    };
 
-    await this.replyMessage(replyToken, helpMessage);
+    await this.replyFlexMessage(replyToken, "ヘルプ", helpCard);
   }
 
-  private async handleManualExpenseEntry(replyToken: string): Promise<void> {
-    const message = `📝 支出を記録\n\n` +
-      `金額を数字で入力してください。\n` +
-      `例: "2500"\n\n` +
-      `💡 金額のみ入力すると「手動入力」として記録されます。`;
-
-    await this.replyMessage(replyToken, message);
-  }
-
-  private async handleReceiptUploadInstruction(replyToken: string): Promise<void> {
-    const message = `📷 レシート取込\n\n` +
-      `レシートの写真を撮影して送信してください。\n\n` +
-      `✅ 自動で金額を読み取ります\n` +
-      `✅ 外貨にも対応しています\n` +
-      `✅ 店舗名も認識可能です\n\n` +
-      `💡 写真は鮮明に撮影してください！`;
-
-    await this.replyMessage(replyToken, message);
-  }
 
   private async handleTodayBalance(replyToken: string, userId: string): Promise<void> {
     try {
@@ -482,23 +706,9 @@ export class BudgetBot {
         return;
       }
 
-      const todaySpent = await databaseService.getTodaySpent(userId);
-      const today = new Date();
-      const lastDayOfMonth = new Date(today.getFullYear(), today.getMonth() + 1, 0).getDate();
-      const remainingDays = lastDayOfMonth - today.getDate() + 1;
-      
-      const monthlyRemaining = Math.max(0, stats.monthlyBudget - stats.currentSpent);
-      const dailyBudget = remainingDays > 0 ? Math.floor(monthlyRemaining / remainingDays) : 0;
-      const todayRemaining = Math.max(0, dailyBudget - todaySpent);
-
-      const message = `💵 今日の残高\n\n` +
-        `📅 今日: ${today.getMonth() + 1}/${today.getDate()}\n` +
-        `💰 今日使用可能: ¥${todayRemaining.toLocaleString()}\n` +
-        `📊 今日の支出: ¥${todaySpent.toLocaleString()}\n` +
-        `📆 残り日数: ${remainingDays}日\n\n` +
-        `💡 1日平均予算: ¥${dailyBudget.toLocaleString()}`;
-
-      await this.replyMessage(replyToken, message);
+      // 予算確認と同じカードを表示（旧レポート機能）
+      const flexContent = await this.createBudgetProgressCard(stats, userId);
+      await this.replyFlexMessage(replyToken, '📊 今日の残高', flexContent);
     } catch (error) {
       console.error('Today balance error:', error);
       await this.replyMessage(replyToken, '❌ 残高の取得中にエラーが発生しました。');
@@ -506,33 +716,150 @@ export class BudgetBot {
   }
 
   private async handleReport(replyToken: string, userId: string): Promise<void> {
-    try {
-      const stats = await databaseService.getUserStats(userId);
-      if (!stats) {
-        await this.replyMessage(replyToken, '❌ ユーザー情報が見つかりません。まず予算を設定してください。');
-        return;
-      }
-
-      // 予算確認と同じカードを表示
-      const flexContent = await this.createBudgetProgressCard(stats, userId);
-      await this.replyFlexMessage(replyToken, '📊 支出レポート', flexContent);
-    } catch (error) {
-      console.error('Report error:', error);
-      await this.replyMessage(replyToken, '❌ レポートの生成中にエラーが発生しました。');
-    }
-  }
-
-  private async handleBudgetSetInstruction(replyToken: string): Promise<void> {
-    const message = `💰 予算設定\n\n` +
-      `月間予算を設定してください。\n` +
-      `「予算設定 50000」のように入力してください。\n\n` +
-      `例:\n` +
-      `・予算設定 30000\n` +
-      `・予算設定 50000\n` +
-      `・予算設定 100000\n\n` +
-      `💡 数字のみでも設定可能です！`;
+    const message = `📈 レポート機能\n\n` +
+      `週間・月間の詳細なレポート機能は\n` +
+      `現在開発中です。\n\n` +
+      `📊 現在利用可能な機能:\n` +
+      `• 今日の残高（進捗グラフ表示）\n` +
+      `• 取引履歴の確認\n` +
+      `• 予算設定・変更\n\n` +
+      `💡 もうしばらくお待ちください！`;
 
     await this.replyMessage(replyToken, message);
+  }
+
+  private async handleBudgetSetInstruction(replyToken: string, userId?: string): Promise<void> {
+    // 予算設定待機状態を設定
+    if (userId) {
+      this.pendingBudgetSets.set(userId, {
+        userId,
+        timestamp: Date.now()
+      });
+    }
+    const now = new Date();
+    const currentMonth = now.getMonth() + 1;
+    const currentYear = now.getFullYear();
+    const lastDayOfMonth = new Date(currentYear, currentMonth, 0).getDate();
+    
+    const budgetInputCard = {
+      type: "bubble",
+      header: {
+        type: "box",
+        layout: "vertical",
+        contents: [
+          {
+            type: "text",
+            text: "💰 予算設定",
+            weight: "bold",
+            color: "#ffffff",
+            size: "lg",
+            align: "center"
+          }
+        ],
+        backgroundColor: "#2196F3",
+        paddingAll: "20px"
+      },
+      body: {
+        type: "box",
+        layout: "vertical",
+        contents: [
+          {
+            type: "text",
+            text: `${currentYear}年${currentMonth}月の予算`,
+            weight: "bold",
+            size: "md",
+            color: "#333333",
+            align: "center",
+            margin: "md"
+          },
+          {
+            type: "text",
+            text: `${currentMonth}月${lastDayOfMonth}日まで`,
+            size: "sm",
+            color: "#666666",
+            align: "center",
+            margin: "sm"
+          },
+          {
+            type: "separator",
+            margin: "lg"
+          },
+          {
+            type: "box",
+            layout: "vertical",
+            contents: [
+              {
+                type: "text",
+                text: "💡 金額のみを入力してください",
+                size: "sm",
+                color: "#999999",
+                align: "center",
+                margin: "lg"
+              },
+              {
+                type: "text",
+                text: "例: 50000",
+                size: "sm",
+                color: "#2196F3",
+                align: "center",
+                weight: "bold",
+                margin: "sm"
+              }
+            ],
+            backgroundColor: "#f8f9fa",
+            cornerRadius: "8px",
+            paddingAll: "16px",
+            margin: "lg"
+          }
+        ],
+        paddingAll: "20px"
+      },
+      footer: {
+        type: "box",
+        layout: "vertical",
+        contents: [
+          {
+            type: "text",
+            text: "下のメッセージ入力欄に金額を入力してください",
+            size: "xs",
+            color: "#999999",
+            align: "center",
+            wrap: true
+          }
+        ],
+        paddingAll: "16px"
+      }
+    };
+
+    // クイックリプライオプションを作成（40,000円から100,000円まで10,000円刻み）
+    const quickReplyItems = [];
+    for (let amount = 40000; amount <= 100000; amount += 10000) {
+      quickReplyItems.push({
+        type: "action",
+        action: {
+          type: "message",
+          label: `¥${amount.toLocaleString()}`,
+          text: amount.toString()
+        }
+      });
+    }
+
+    const quickReply = {
+      items: quickReplyItems
+    };
+
+    // Flex MessageとQuick Replyを組み合わせて送信
+    const message = {
+      type: "flex",
+      altText: "予算設定",
+      contents: budgetInputCard,
+      quickReply: quickReply
+    };
+
+    await this.client.replyMessage({
+      replyToken,
+      messages: [message as any]
+    });
   }
 
 
@@ -988,7 +1315,7 @@ export class BudgetBot {
     };
   }
 
-  private createTransactionDeleteCard(transaction: Transaction): any {
+  private createTransactionDeleteCard(transaction: Transaction, token: string): any {
     return {
       type: 'bubble',
       size: 'kilo',
@@ -1097,7 +1424,7 @@ export class BudgetBot {
             action: {
               type: 'postback',
               label: '🗑️ 削除する',
-              data: `confirm_delete_${transaction.id}`
+              data: `confirm_delete_${token}`
             }
           },
           {
@@ -1107,7 +1434,7 @@ export class BudgetBot {
             action: {
               type: 'postback',
               label: '❌ キャンセル',
-              data: 'cancel_delete'
+              data: `cancel_delete_${token}`
             }
           }
         ],
@@ -1116,7 +1443,7 @@ export class BudgetBot {
     };
   }
 
-  private createEditConfirmationCard(transaction: Transaction, newAmount: number): any {
+  private createEditConfirmationCard(transaction: Transaction, newAmount: number, token: string): any {
     return {
       type: 'bubble',
       size: 'kilo',
@@ -1257,7 +1584,7 @@ export class BudgetBot {
             action: {
               type: 'postback',
               label: '✅ 確定',
-              data: `confirm_edit_${transaction.id}_${newAmount}`
+              data: `confirm_edit_${token}`
             }
           },
           {
@@ -1267,7 +1594,7 @@ export class BudgetBot {
             action: {
               type: 'postback',
               label: '❌ キャンセル',
-              data: 'cancel_edit'
+              data: `cancel_edit_${token}`
             }
           }
         ],
@@ -2126,7 +2453,7 @@ export class BudgetBot {
         await this.handleBudgetStatus(replyToken, userId);
         break;
       case 'menu_history':
-        await this.handleTransactionHistory(replyToken, userId);
+        await this.handleHistory(replyToken, userId);
         break;
       case 'menu_reset':
         await this.handleBudgetReset(replyToken, userId);
@@ -2196,6 +2523,9 @@ export class BudgetBot {
 
   private async handleTransactionDelete(replyToken: string, userId: string, transactionId: string): Promise<void> {
     try {
+      // 期限切れトークンをクリーンアップ
+      this.cleanupExpiredTokens();
+      
       // 取引情報を取得して確認メッセージを表示
       const transactions = await databaseService.getRecentTransactions(userId, 50);
       const transactionIdNum = parseInt(transactionId);
@@ -2206,7 +2536,20 @@ export class BudgetBot {
         return;
       }
 
-      const deleteCard = this.createTransactionDeleteCard(transaction);
+      // ワンタイム・トークンを生成
+      const token = this.generateDeleteToken();
+      const deleteRequest: DeleteRequest = {
+        userId,
+        transactionId: transactionIdNum,
+        token,
+        timestamp: Date.now()
+      };
+      
+      // トークンを保存
+      this.deleteRequests.set(token, deleteRequest);
+      console.log(`🔐 Delete token generated: ${token} for transaction ${transactionIdNum}`);
+
+      const deleteCard = this.createTransactionDeleteCard(transaction, token);
       await this.replyFlexMessage(replyToken, '🗑️ 取引削除確認', deleteCard);
     } catch (error) {
       console.error('Transaction delete error:', error);
@@ -2216,6 +2559,9 @@ export class BudgetBot {
 
   private async handleDirectEditAmount(replyToken: string, userId: string, transactionId: number, newAmount: number): Promise<void> {
     try {
+      // 期限切れトークンをクリーンアップ
+      this.cleanupExpiredTokens();
+      
       // レシート編集の場合（transactionId = -1）
       if (transactionId === -1) {
         await this.handleReceiptAmountEdit(replyToken, userId, newAmount);
@@ -2231,8 +2577,22 @@ export class BudgetBot {
         return;
       }
 
+      // ワンタイム・トークンを生成
+      const token = this.generateDeleteToken(); // 同じ生成ロジックを使用
+      const editRequest: EditRequest = {
+        userId,
+        transactionId,
+        newAmount,
+        token,
+        timestamp: Date.now()
+      };
+      
+      // トークンを保存
+      this.editRequests.set(token, editRequest);
+      console.log(`🔐 Edit token generated: ${token} for transaction ${transactionId}`);
+
       // 編集確認カードを表示
-      const confirmCard = this.createEditConfirmationCard(transaction, newAmount);
+      const confirmCard = this.createEditConfirmationCard(transaction, newAmount, token);
       await this.replyFlexMessage(replyToken, '✏️ 編集内容確認', confirmCard);
     } catch (error) {
       console.error('Direct edit error:', error);
@@ -2282,15 +2642,33 @@ export class BudgetBot {
     }
   }
 
-  private async handleTransactionDeleteConfirm(replyToken: string, userId: string, transactionId: string): Promise<void> {
+  private async handleTransactionDeleteConfirm(replyToken: string, userId: string, token: string): Promise<void> {
     try {
-      const transactionIdNum = parseInt(transactionId);
-      if (isNaN(transactionIdNum)) {
-        await this.replyMessage(replyToken, '❌ 無効な取引IDです。');
+      // 期限切れトークンをクリーンアップ
+      this.cleanupExpiredTokens();
+      
+      // トークンの検証
+      const deleteRequest = this.deleteRequests.get(token);
+      if (!deleteRequest) {
+        await this.replyMessage(replyToken, '❌ 削除リクエストが無効または期限切れです。');
+        console.log(`🔒 Invalid or expired delete token: ${token}`);
         return;
       }
 
-      const result = await databaseService.deleteTransaction(userId, transactionIdNum);
+      // ユーザーIDの検証
+      if (deleteRequest.userId !== userId) {
+        await this.replyMessage(replyToken, '❌ 削除権限がありません。');
+        console.log(`🚫 Unauthorized delete attempt: ${userId} != ${deleteRequest.userId}`);
+        // 不正アクセス試行時はトークンを即座に削除
+        this.deleteRequests.delete(token);
+        return;
+      }
+
+      // トークンを失効（ワンタイム使用）
+      this.deleteRequests.delete(token);
+      console.log(`🔐 Delete token consumed: ${token}`);
+
+      const result = await databaseService.deleteTransaction(userId, deleteRequest.transactionId);
       
       const message = `✅ 取引を削除しました\n\n` +
         `削除された金額: ${result.deletedAmount.toLocaleString()}円`;
@@ -2310,6 +2688,101 @@ export class BudgetBot {
       } else {
         await this.replyMessage(replyToken, '❌ 取引の削除中にエラーが発生しました。');
       }
+    }
+  }
+
+  private async handleDeleteCancel(replyToken: string, token: string): Promise<void> {
+    try {
+      // トークンの検証とクリーンアップ
+      this.cleanupExpiredTokens();
+      
+      const deleteRequest = this.deleteRequests.get(token);
+      if (!deleteRequest) {
+        await this.replyMessage(replyToken, '❌ キャンセルリクエストが無効または期限切れです。');
+        console.log(`🔒 Invalid or expired cancel token: ${token}`);
+        return;
+      }
+
+      // トークンを失効（キャンセル時も削除）
+      this.deleteRequests.delete(token);
+      console.log(`🔐 Cancel token consumed: ${token}`);
+
+      await this.replyMessage(replyToken, '❌ 削除をキャンセルしました。');
+    } catch (error) {
+      console.error('Delete cancel error:', error);
+      await this.replyMessage(replyToken, '❌ キャンセル処理中にエラーが発生しました。');
+    }
+  }
+
+  private async handleEditConfirm(replyToken: string, userId: string, token: string): Promise<void> {
+    try {
+      // 期限切れトークンをクリーンアップ
+      this.cleanupExpiredTokens();
+      
+      // トークンの検証
+      const editRequest = this.editRequests.get(token);
+      if (!editRequest) {
+        await this.replyMessage(replyToken, '❌ 編集リクエストが無効または期限切れです。');
+        console.log(`🔒 Invalid or expired edit token: ${token}`);
+        return;
+      }
+
+      // ユーザーIDの検証
+      if (editRequest.userId !== userId) {
+        await this.replyMessage(replyToken, '❌ 編集権限がありません。');
+        console.log(`🚫 Unauthorized edit attempt: ${userId} != ${editRequest.userId}`);
+        // 不正アクセス試行時はトークンを即座に削除
+        this.editRequests.delete(token);
+        return;
+      }
+
+      // トークンを失効（ワンタイム使用）
+      this.editRequests.delete(token);
+      console.log(`🔐 Edit token consumed: ${token}`);
+
+      const result = await databaseService.editTransaction(userId, editRequest.transactionId, editRequest.newAmount);
+      
+      const message = `✅ 取引を編集しました\n\n` +
+        `変更後: ¥${editRequest.newAmount.toLocaleString()}`;
+
+      await this.replyMessage(replyToken, message);
+
+      // 更新された予算状況を表示
+      const stats = await databaseService.getUserStats(userId);
+      if (stats) {
+        const flexContent = await this.createBudgetProgressCard(stats, userId);
+        await this.pushFlexMessage(userId, '更新された予算状況', flexContent);
+      }
+    } catch (error) {
+      console.error('Edit confirm error:', error);
+      if (error instanceof Error && error.message === 'Transaction not found') {
+        await this.replyMessage(replyToken, '❌ 指定された取引が見つかりません。');
+      } else {
+        await this.replyMessage(replyToken, '❌ 取引の編集中にエラーが発生しました。');
+      }
+    }
+  }
+
+  private async handleEditCancel(replyToken: string, token: string): Promise<void> {
+    try {
+      // トークンの検証とクリーンアップ
+      this.cleanupExpiredTokens();
+      
+      const editRequest = this.editRequests.get(token);
+      if (!editRequest) {
+        await this.replyMessage(replyToken, '❌ キャンセルリクエストが無効または期限切れです。');
+        console.log(`🔒 Invalid or expired edit cancel token: ${token}`);
+        return;
+      }
+
+      // トークンを失効（キャンセル時も削除）
+      this.editRequests.delete(token);
+      console.log(`🔐 Edit cancel token consumed: ${token}`);
+
+      await this.replyMessage(replyToken, '❌ 編集をキャンセルしました。');
+    } catch (error) {
+      console.error('Edit cancel error:', error);
+      await this.replyMessage(replyToken, '❌ キャンセル処理中にエラーが発生しました。');
     }
   }
 }
