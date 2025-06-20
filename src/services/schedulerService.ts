@@ -1,10 +1,12 @@
+import * as cron from 'node-cron';
 import { BudgetBot } from '../bot/budgetBot';
 import { databaseService } from '../database/prisma';
 import { exchangeRateUpdateService } from './exchangeRateUpdateService';
 
 export class SchedulerService {
   private budgetBot: BudgetBot;
-  private intervalId: NodeJS.Timeout | null = null;
+  private weeklyReportTask: cron.ScheduledTask | null = null;
+  private exchangeRateUpdateTasks: cron.ScheduledTask[] = [];
 
   constructor(budgetBot: BudgetBot) {
     this.budgetBot = budgetBot;
@@ -14,14 +16,34 @@ export class SchedulerService {
   start(): void {
     this.stop(); // 既存のスケジューラーがあれば停止
 
-    // 1分ごとにチェック（実際の運用では5分間隔でも十分）
-    this.intervalId = setInterval(() => {
-      this.checkAndSendWeeklyReport();
-      this.checkAndUpdateExchangeRates();
-    }, 60 * 1000); // 1分間隔
+    // 週間レポート送信: 毎週月曜日 6:00 JST (UTC 21:00 日曜日)
+    this.weeklyReportTask = cron.schedule('0 21 * * 0', async () => {
+      console.log('📊 Starting weekly report cron job...');
+      await this.sendWeeklyReportsToAllUsers();
+    }, {
+      timezone: 'UTC'
+    });
 
-    console.log('📅 Scheduler started - Weekly reports will be sent every Monday at 6:00 AM JST');
-    console.log('💱 Exchange rate updates will run 3 times per day (6:00, 12:00, 18:00 JST)');
+    // 為替レート更新: 1日3回 (6:00, 12:00, 18:00 JST = UTC 21:00, 03:00, 09:00)
+    const exchangeRateSchedules = [
+      { time: '0 21 * * *', label: '6:00 JST' },   // 6:00 JST = 21:00 UTC 前日
+      { time: '0 3 * * *', label: '12:00 JST' },   // 12:00 JST = 3:00 UTC
+      { time: '0 9 * * *', label: '18:00 JST' }    // 18:00 JST = 9:00 UTC
+    ];
+
+    exchangeRateSchedules.forEach(({ time, label }) => {
+      const task = cron.schedule(time, async () => {
+        console.log(`💱 Starting exchange rate update cron job at ${label}...`);
+        await exchangeRateUpdateService.updateAllExchangeRates();
+      }, {
+        timezone: 'UTC'
+      });
+      this.exchangeRateUpdateTasks.push(task);
+    });
+
+    console.log('📅 Cron-based scheduler started successfully');
+    console.log('📅 Weekly reports: Every Monday at 6:00 AM JST');
+    console.log('💱 Exchange rate updates: 3 times per day (6:00, 12:00, 18:00 JST)');
     
     // 起動時に初回レート更新を実行
     this.performInitialExchangeRateUpdate();
@@ -29,34 +51,19 @@ export class SchedulerService {
 
   // 停止
   stop(): void {
-    if (this.intervalId) {
-      clearInterval(this.intervalId);
-      this.intervalId = null;
-      console.log('📅 Scheduler stopped');
+    if (this.weeklyReportTask) {
+      this.weeklyReportTask.stop();
+      this.weeklyReportTask = null;
     }
+
+    this.exchangeRateUpdateTasks.forEach(task => {
+      task.stop();
+    });
+    this.exchangeRateUpdateTasks = [];
+
+    console.log('📅 Cron-based scheduler stopped');
   }
 
-  // 送信チェック
-  private async checkAndSendWeeklyReport(): Promise<void> {
-    try {
-      const now = new Date();
-      const jstOffset = 9 * 60 * 60 * 1000; // JST offset
-      const jstNow = new Date(now.getTime() + jstOffset);
-
-      // 月曜日かつ6時台かどうかチェック
-      const dayOfWeek = jstNow.getDay(); // 0: 日曜日, 1: 月曜日
-      const hour = jstNow.getHours();
-      const minute = jstNow.getMinutes();
-
-      // 月曜日の6:00-6:05の間に実行
-      if (dayOfWeek === 1 && hour === 6 && minute < 5) {
-        console.log('📊 Sending weekly trend reports...');
-        await this.sendWeeklyReportsToAllUsers();
-      }
-    } catch (error) {
-      console.error('❌ Error in weekly report scheduler:', error);
-    }
-  }
 
   // ユーザーにレポートを送信
   private async sendWeeklyReportsToAllUsers(): Promise<void> {
@@ -190,26 +197,26 @@ export class SchedulerService {
     await this.sendWeeklyReportToUser(userId);
   }
 
-  // 為替レート更新チェック
-  private async checkAndUpdateExchangeRates(): Promise<void> {
-    try {
-      const now = new Date();
-      const jstOffset = 9 * 60 * 60 * 1000; // JST offset
-      const jstNow = new Date(now.getTime() + jstOffset);
-
-      const hour = jstNow.getHours();
-      const minute = jstNow.getMinutes();
-
-      // 6:00, 12:00, 18:00 の各時刻の00-05分の間に実行
-      const targetHours = [6, 12, 18];
-      if (targetHours.includes(hour) && minute < 5) {
-        console.log(`💱 Updating exchange rates at ${hour}:${minute.toString().padStart(2, '0')} JST`);
-        await exchangeRateUpdateService.updateAllExchangeRates();
-      }
-    } catch (error) {
-      console.error('❌ Error in exchange rate update scheduler:', error);
-    }
+  // Cronジョブの状態確認
+  getSchedulerStatus(): { weeklyReport: boolean; exchangeRateUpdates: number } {
+    return {
+      weeklyReport: this.weeklyReportTask !== null,
+      exchangeRateUpdates: this.exchangeRateUpdateTasks.length
+    };
   }
+
+  // 手動で為替レート更新を実行
+  async triggerExchangeRateUpdate(): Promise<void> {
+    console.log('🔧 Manual exchange rate update triggered');
+    await exchangeRateUpdateService.updateAllExchangeRates();
+  }
+
+  // 手動で週間レポート送信を実行
+  async triggerWeeklyReports(): Promise<void> {
+    console.log('🔧 Manual weekly report triggered');
+    await this.sendWeeklyReportsToAllUsers();
+  }
+
 
   // 起動時の初回レート更新
   private async performInitialExchangeRateUpdate(): Promise<void> {
