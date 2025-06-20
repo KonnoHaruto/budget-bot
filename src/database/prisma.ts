@@ -96,6 +96,7 @@ export class DatabaseService {
     }
 
     const amountDifference = newAmount - existingTransaction.amount;
+    const oldAmount = existingTransaction.amount;
 
     // トランザクションで取引を更新し、ユーザーの累計を調整
     const [updatedTransaction] = await prisma.$transaction([
@@ -113,7 +114,11 @@ export class DatabaseService {
       })
     ]);
 
-    return updatedTransaction;
+    return {
+      ...updatedTransaction,
+      oldAmount,
+      newAmount
+    };
   }
 
   async deleteTransaction(lineUserId: string, transactionId: number) {

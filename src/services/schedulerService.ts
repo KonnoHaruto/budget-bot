@@ -97,18 +97,8 @@ export class SchedulerService {
           await this.budgetBot.pushMessage(userId, adviceMessage);
         }
 
-        // クイックリプライで今週の目標設定を促す
-        const quickReplyItems = [
-          { label: '📊 予算確認', text: '予算確認' },
-          { label: '💰 予算調整', text: '予算設定' },
-          { label: '📈 詳細分析', text: 'トレンド分析' }
-        ];
-
-        await this.budgetBot.pushMessageWithQuickReply(
-          userId, 
-          '今週も賢い支出を心がけましょう！🎯', 
-          quickReplyItems
-        );
+        // 週間目標メッセージを送信
+        await this.budgetBot.pushMessage(userId, '今週も賢い支出を心がけましょう！🎯');
 
         console.log(`✅ Weekly report sent to user: ${userId}`);
       }
