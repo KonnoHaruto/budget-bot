@@ -4,6 +4,7 @@ import { ocrService } from '../services/ocrService';
 import { CurrencyService, ParsedAmount } from '../services/currencyService';
 import { chartService, ChartData } from '../services/chartService';
 import { RichMenuService } from '../services/richMenuService';
+import { cloudTasksService } from '../services/cloudTasksService';
 import { PrismaClient } from '@prisma/client';
 
 type Transaction = {
@@ -94,6 +95,37 @@ export class BudgetBot {
 
   private generateDeleteToken(): string {
     return Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
+  }
+
+  // Cloud Tasks用のパブリックメソッド
+  public getBlobClient(): line.messagingApi.MessagingApiBlobClient {
+    return this.blobClient;
+  }
+
+  public async generateExpenseToken(userId: string): Promise<string> {
+    this.cleanupExpiredTokens();
+    const token = this.generateDeleteToken();
+    this.expenseConfirmRequests.set(token, {
+      userId,
+      token,
+      timestamp: Date.now()
+    });
+    return token;
+  }
+
+  public async savePendingTransaction(userId: string, transaction: PendingTransaction): Promise<void> {
+    this.pendingTransactions.set(userId, transaction);
+  }
+
+  public async createConfirmationCard(
+    amount: number, 
+    originalAmount?: number, 
+    currency?: string, 
+    rate?: number, 
+    storeName?: string,
+    token?: string
+  ): Promise<any> {
+    return this.createReceiptConfirmationCard(amount, originalAmount, currency, rate, storeName, token);
   }
 
   private cleanupExpiredTokens(): void {
@@ -273,62 +305,33 @@ export class BudgetBot {
   }
 
   private async handleImageMessage(replyToken: string, userId: string, messageId: string): Promise<void> {
-    let hasReplied = false;
-    
     try {
       // Send processing started message immediately
       await this.replyMessage(replyToken, '処理を開始しました。');
-      hasReplied = true;
+      console.log(`🚀 Processing started message sent for user: ${userId}`);
 
-      // Get image content from LINE
-      const stream = await this.blobClient.getMessageContent(messageId);
-      
-      // Convert stream to buffer
-      const chunks: Buffer[] = [];
-      for await (const chunk of stream) {
-        chunks.push(chunk);
-      }
-      const imageBuffer = Buffer.concat(chunks);
+      // Enqueue receipt processing task to Cloud Tasks
+      await cloudTasksService.enqueueReceiptProcessing({
+        userId,
+        messageId,
+        replyToken
+      });
 
-      // Send processing message immediately to avoid token timeout
-      await this.replyMessage(replyToken, '📷 レシートを処理中です...');
-      hasReplied = true;
+      console.log(`📝 Receipt processing task enqueued for user: ${userId}, messageId: ${messageId}`);
 
-      // Extract text from image using OCR
-      const extractedText = await ocrService.extractTextFromImage(imageBuffer);
-      const receiptInfo = ocrService.parseReceiptInfo(extractedText);
-
-      if (receiptInfo.amounts && receiptInfo.amounts.length > 0) {
-        
-        // 為替変換を実行
-        await this.processReceiptAmounts(userId, receiptInfo.amounts, receiptInfo.storeName);
-      } else {
-        await this.pushMessage(
-          userId, 
-          '⚠️ レシートから金額を読み取れませんでした。\n手動で金額を入力してください。\n例: "1500" または "1500円"'
-        );
-      }
     } catch (error) {
-      console.error('Image processing error:', error);
+      console.error('❌ Failed to enqueue receipt processing task:', error);
       
-      // Provide specific error messages
-      let errorMessage = '❌ 画像の処理中にエラーが発生しました。';
+      // Fallback error message
+      let errorMessage = '❌ 処理の開始に失敗しました。手動で金額を入力してください。\n例: "1500" または "1500円"';
       
       if (error instanceof Error) {
-        if (error.message.includes('OCR service is not available')) {
-          errorMessage = '⚠️ OCR機能が利用できません。\n手動で金額を入力してください。\n例: "1500" または "1500円"';
-        } else if (error.message.includes('credentials')) {
-          errorMessage = '⚠️ 画像認識サービスの設定が必要です。\n手動で金額を入力してください。\n例: "1500" または "1500円"';
-        } else if (error.message.includes('billing')) {
-          errorMessage = '⚠️ 画像認識サービスの課金設定が必要です。\n手動で金額を入力してください。\n例: "1500" または "1500円"';
+        if (error.message.includes('Cloud Tasks')) {
+          errorMessage = '❌ 処理システムが一時的に利用できません。しばらく待ってから再度お試しください。';
         }
       }
       
-      if (hasReplied) {
-        await this.pushMessage(userId, errorMessage);
-      } else {
-        await this.replyMessage(replyToken, errorMessage);
-      }
+      await this.replyMessage(replyToken, errorMessage);
     }
   }
 
