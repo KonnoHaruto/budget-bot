@@ -26,9 +26,9 @@ export class SchedulerService {
 
     // 為替レート更新: 1日3回 (6:00, 12:00, 18:00 JST = UTC 21:00, 03:00, 09:00)
     const exchangeRateSchedules = [
-      { time: '0 21 * * *', label: '6:00 JST' },   // 6:00 JST = 21:00 UTC 前日
-      { time: '0 3 * * *', label: '12:00 JST' },   // 12:00 JST = 3:00 UTC
-      { time: '0 9 * * *', label: '18:00 JST' }    // 18:00 JST = 9:00 UTC
+      { time: '0 21 * * *', label: '6:00 JST' },
+      { time: '0 3 * * *', label: '12:00 JST' },
+      { time: '0 9 * * *', label: '18:00 JST' }
     ];
 
     exchangeRateSchedules.forEach(({ time, label }) => {
@@ -45,7 +45,6 @@ export class SchedulerService {
     console.log('📅 Weekly reports: Every Monday at 6:00 AM JST');
     console.log('💱 Exchange rate updates: 3 times per day (6:00, 12:00, 18:00 JST)');
     
-    // 起動時に初回レート更新を実行
     this.performInitialExchangeRateUpdate();
   }
 
@@ -68,13 +67,11 @@ export class SchedulerService {
   // ユーザーにレポートを送信
   private async sendWeeklyReportsToAllUsers(): Promise<void> {
     try {
-      // 全ユーザーを取得（今回は簡易実装）
       const users = await this.getAllUsers();
       
       for (const user of users) {
         try {
           await this.sendWeeklyReportToUser(user.lineUserId);
-          // 各ユーザー間に少し間隔を空ける
           await this.delay(1000);
         } catch (error) {
           console.error(`❌ Failed to send weekly report to user ${user.lineUserId}:`, error);
@@ -102,8 +99,6 @@ export class SchedulerService {
         // 週間トレンドカードを送信
         await this.budgetBot.pushFlexMessage(userId, '📈 Weekly Spending Report', weeklyTrendCard);
 
-        // 追加のアドバイスメッセージ
-        // この部分はAIを導入したい
         const stats = await databaseService.getUserStats(userId);
         if (stats) {
           const adviceMessage = await this.generateWeeklyAdvice(userId, stats);
@@ -121,15 +116,13 @@ export class SchedulerService {
   }
 
   // アドバイスの生成
-  // 後々AIを使用
   private async generateWeeklyAdvice(userId: string, stats: any): Promise<string> {
     try {
       const today = new Date();
       const lastWeek = new Date(today.getTime() - 7 * 24 * 60 * 60 * 1000);
       
-      // 先週の支出を計算（簡易版）
       const lastWeekSpent = await this.getWeekSpent(userId, lastWeek);
-      const weeklyBudget = stats.monthlyBudget / 4; // 概算の週間予算
+      const weeklyBudget = stats.monthlyBudget / 4;
       
       let advice = '🤖 今週のアドバイス\n\n';
       
@@ -159,7 +152,6 @@ export class SchedulerService {
     try {
       const weekEnd = new Date(weekStart.getTime() + 7 * 24 * 60 * 60 * 1000);
       
-      // TEST：その週の取引を合計
       const transactions = await databaseService.getRecentTransactions(userId, 100);
       return transactions
         .filter((t: any) => {
@@ -176,8 +168,6 @@ export class SchedulerService {
   // 全ユーザーを取得
   private async getAllUsers(): Promise<{ lineUserId: string }[]> {
     try {
-      // Prismaを使って全ユーザーを取得
-      // 翻案環境ではページネーションを使用
       const users = await databaseService.getAllUsers();
       return users.map(user => ({ lineUserId: user.lineUserId }));
     } catch (error) {

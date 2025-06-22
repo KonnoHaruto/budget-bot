@@ -232,6 +232,424 @@ export class BudgetBot {
     }
   }
 
+  async handleFollow(event: line.FollowEvent): Promise<void> {
+    const userId = event.source.userId;
+    const replyToken = event.replyToken;
+    
+    if (!userId) {
+      console.log('⚠️ Follow event received but no userId found');
+      return;
+    }
+
+    console.log(`👋 New user followed: ${userId}`);
+    console.log('📋 Follow event details:', JSON.stringify(event, null, 2));
+
+    try {
+      // ユーザーをデータベースに作成
+      let user = await databaseService.getUser(userId);
+      if (!user) {
+        console.log(`🆕 Creating new user: ${userId}`);
+        user = await databaseService.createUser(userId);
+        console.log(`✅ New user created:`, user);
+      } else {
+        console.log(`👤 Existing user found:`, user);
+      }
+
+      // ウェルカムメッセージを送信（Reply Messageとして）
+      console.log(`📧 Calling sendWelcomeMessage for user: ${userId} with replyToken: ${replyToken}`);
+      await this.sendWelcomeMessage(userId, replyToken);
+      console.log(`✅ handleFollow completed for user: ${userId}`);
+      
+    } catch (error) {
+      console.error(`❌ Error in handleFollow for user ${userId}:`, error);
+    }
+  }
+
+  async handleUnfollow(event: line.UnfollowEvent): Promise<void> {
+    const userId = event.source.userId;
+    if (!userId) return;
+
+    console.log(`👋 User unfollowed: ${userId}`);
+    // アンフォロー時の処理（必要に応じて）
+  }
+
+  private async sendWelcomeMessage(userId: string, replyToken?: string): Promise<void> {
+    try {
+      console.log(`📧 Sending welcome message to user: ${userId}`);
+      
+      // 予算設定待機状態に設定
+      this.pendingBudgetSets.set(userId, {
+        userId,
+        timestamp: Date.now()
+      });
+      console.log(`⏰ Set pending budget state for user: ${userId}`);
+
+      // Flex Messageでウェルカムメッセージを作成
+      const welcomeCard = this.createWelcomeBudgetCard();
+      
+      // Quick Replyオプションを作成（30,000円から100,000円まで10,000円刻み）
+      const quickReplyItems = [];
+      for (let amount = 30000; amount <= 100000; amount += 10000) {
+        quickReplyItems.push({
+          type: "action",
+          action: {
+            type: "message",
+            label: `¥${amount.toLocaleString()}`,
+            text: amount.toString()
+          }
+        });
+      }
+
+      const quickReply = {
+        items: quickReplyItems
+      };
+
+      // Flex MessageとQuick Replyを組み合わせて送信
+      const message = {
+        type: "flex",
+        altText: "🎉 予算管理ボットへようこそ！まずは月間予算を設定しましょう",
+        contents: welcomeCard,
+        quickReply: quickReply
+      };
+
+      if (replyToken) {
+        // Reply Messageとして送信（無料）
+        console.log(`📤 Sending welcome flex message as reply to ${userId}...`);
+        const response = await this.client.replyMessage({
+          replyToken,
+          messages: [message as any]
+        });
+        console.log(`✅ Welcome reply message sent successfully:`, response);
+      } else {
+        // replyTokenが無い場合は送信しない（Push Message削除）
+        console.log(`⚠️ No replyToken available for ${userId}, skipping welcome message to avoid push message charges`);
+      }
+      
+      // ヒントメッセージは削除（Push Message課金を避けるため）
+      // ユーザーは既にQuick Replyボタンがあるので、追加のヒントは不要
+      
+    } catch (error) {
+      console.error(`❌ Failed to send welcome message to ${userId}:`, error);
+      
+      // フォールバックもReply Messageのみに限定
+      try {
+        if (replyToken) {
+          await this.replyMessage(replyToken,
+            '🎉 予算管理ボットへようこそ！\n\n' +
+            'まずは月間予算を設定しましょう。\n' +
+            '金額を数字で入力してください。\n\n' +
+            '例: 50000'
+          );
+          console.log(`✅ Fallback welcome reply message sent to ${userId}`);
+        } else {
+          console.log(`⚠️ No replyToken for fallback message to ${userId}, skipping to avoid push message charges`);
+        }
+      } catch (fallbackError) {
+        console.error(`❌ Failed to send fallback welcome message:`, fallbackError);
+      }
+    }
+  }
+
+  private createWelcomeBudgetCard(): any {
+    return {
+      type: 'bubble',
+      header: {
+        type: 'box',
+        layout: 'vertical',
+        contents: [
+          {
+            type: 'text',
+            text: '🎉 ようこそ！',
+            weight: 'bold',
+            color: '#ffffff',
+            size: 'xl',
+            align: 'center'
+          },
+          {
+            type: 'text',
+            text: '予算管理ボット',
+            color: '#ffffff',
+            size: 'md',
+            align: 'center',
+            margin: 'sm'
+          }
+        ],
+        backgroundColor: '#1DB446',
+        paddingAll: '20px'
+      },
+      body: {
+        type: 'box',
+        layout: 'vertical',
+        contents: [
+          {
+            type: 'text',
+            text: 'まずは月間予算を\n設定しましょう！',
+            size: 'lg',
+            weight: 'bold',
+            align: 'center',
+            color: '#333333'
+          },
+          {
+            type: 'separator',
+            margin: 'xl'
+          },
+          {
+            type: 'box',
+            layout: 'vertical',
+            margin: 'xl',
+            spacing: 'md',
+            contents: [
+              {
+                type: 'box',
+                layout: 'horizontal',
+                contents: [
+                  {
+                    type: 'text',
+                    text: '💰',
+                    flex: 0,
+                    size: 'xl'
+                  },
+                  {
+                    type: 'text',
+                    text: '下のボタンから金額を選択',
+                    flex: 1,
+                    margin: 'md',
+                    size: 'md',
+                    color: '#666666'
+                  }
+                ]
+              },
+              {
+                type: 'box',
+                layout: 'horizontal',
+                margin: 'md',
+                contents: [
+                  {
+                    type: 'text',
+                    text: '✏️',
+                    flex: 0,
+                    size: 'xl'
+                  },
+                  {
+                    type: 'text',
+                    text: 'または直接金額を入力',
+                    flex: 1,
+                    margin: 'md',
+                    size: 'md',
+                    color: '#666666'
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            type: 'separator',
+            margin: 'xl'
+          },
+          {
+            type: 'text',
+            text: '例: 50000 (5万円の場合)',
+            size: 'sm',
+            color: '#999999',
+            align: 'center',
+            margin: 'lg'
+          }
+        ]
+      },
+      footer: {
+        type: 'box',
+        layout: 'vertical',
+        contents: [
+          {
+            type: 'text',
+            text: '💡 設定後に使い方をご案内します',
+            size: 'xs',
+            color: '#1DB446',
+            align: 'center'
+          }
+        ],
+        paddingAll: '16px'
+      }
+    };
+  }
+
+  private async sendTutorialMessage(userId: string): Promise<void> {
+    const tutorialCard = this.createTutorialFlexMessage();
+    await this.pushFlexMessage(userId, '📚 使い方ガイド', tutorialCard);
+  }
+
+  private createTutorialFlexMessage(): any {
+    return {
+      type: 'bubble',
+      body: {
+        type: 'box',
+        layout: 'vertical',
+        contents: [
+          {
+            type: 'text',
+            text: '📚 使い方ガイド',
+            weight: 'bold',
+            size: 'xl',
+            color: '#1DB446'
+          },
+          {
+            type: 'separator',
+            margin: 'md'
+          },
+          {
+            type: 'box',
+            layout: 'vertical',
+            margin: 'lg',
+            spacing: 'sm',
+            contents: [
+              {
+                type: 'box',
+                layout: 'horizontal',
+                contents: [
+                  {
+                    type: 'text',
+                    text: '💰',
+                    size: 'sm',
+                    flex: 0
+                  },
+                  {
+                    type: 'text',
+                    text: '支出を記録する',
+                    size: 'sm',
+                    color: '#555555',
+                    flex: 1,
+                    margin: 'sm'
+                  }
+                ]
+              },
+              {
+                type: 'text',
+                text: '金額を入力するか、レシート画像を送信',
+                size: 'xs',
+                color: '#aaaaaa',
+                margin: 'sm'
+              },
+              {
+                type: 'separator',
+                margin: 'md'
+              },
+              {
+                type: 'box',
+                layout: 'horizontal',
+                margin: 'md',
+                contents: [
+                  {
+                    type: 'text',
+                    text: '📊',
+                    size: 'sm',
+                    flex: 0
+                  },
+                  {
+                    type: 'text',
+                    text: '予算状況を確認する',
+                    size: 'sm',
+                    color: '#555555',
+                    flex: 1,
+                    margin: 'sm'
+                  }
+                ]
+              },
+              {
+                type: 'text',
+                text: '「予算」「残高」「状況」と入力',
+                size: 'xs',
+                color: '#aaaaaa',
+                margin: 'sm'
+              },
+              {
+                type: 'separator',
+                margin: 'md'
+              },
+              {
+                type: 'box',
+                layout: 'horizontal',
+                margin: 'md',
+                contents: [
+                  {
+                    type: 'text',
+                    text: '📝',
+                    size: 'sm',
+                    flex: 0
+                  },
+                  {
+                    type: 'text',
+                    text: '履歴を確認する',
+                    size: 'sm',
+                    color: '#555555',
+                    flex: 1,
+                    margin: 'sm'
+                  }
+                ]
+              },
+              {
+                type: 'text',
+                text: '「履歴」「取引履歴」と入力',
+                size: 'xs',
+                color: '#aaaaaa',
+                margin: 'sm'
+              },
+              {
+                type: 'separator',
+                margin: 'md'
+              },
+              {
+                type: 'box',
+                layout: 'horizontal',
+                margin: 'md',
+                contents: [
+                  {
+                    type: 'text',
+                    text: '🔄',
+                    size: 'sm',
+                    flex: 0
+                  },
+                  {
+                    type: 'text',
+                    text: '予算をリセットする',
+                    size: 'sm',
+                    color: '#555555',
+                    flex: 1,
+                    margin: 'sm'
+                  }
+                ]
+              },
+              {
+                type: 'text',
+                text: '「リセット」と入力',
+                size: 'xs',
+                color: '#aaaaaa',
+                margin: 'sm'
+              }
+            ]
+          }
+        ]
+      },
+      footer: {
+        type: 'box',
+        layout: 'vertical',
+        spacing: 'sm',
+        contents: [
+          {
+            type: 'separator'
+          },
+          {
+            type: 'text',
+            text: '💡 レシート画像を送るだけで自動で金額を読み取ります！',
+            size: 'xs',
+            color: '#1DB446',
+            margin: 'md',
+            align: 'center'
+          }
+        ]
+      }
+    };
+  }
+
   private async handleTextMessage(replyToken: string, userId: string, text: string): Promise<void> {
     const command = text.toLowerCase().trim();
 
@@ -346,6 +764,10 @@ export class BudgetBot {
     }
 
     try {
+      // 初回設定かチェック
+      const existingUser = await databaseService.getUserStats(userId);
+      const isFirstTime = !existingUser || existingUser.monthlyBudget === 0;
+
       await databaseService.updateBudget(userId, amount);
       const message = `✅ 月間予算を ${amount.toLocaleString()}円に設定しました！`;
       
@@ -356,7 +778,10 @@ export class BudgetBot {
       if (stats) {
         const flexContent = await this.createBudgetProgressCard(stats, userId);
         await this.pushFlexMessage(userId, '現在の予算状況', flexContent);
-        await this.pushMessage(userId, '✅ 予算設定が完了しました！');
+        
+        // 予算設定完了メッセージはReply Messageで既に送信済み
+        // 追加のPush Messageは削除（課金対象のため）
+        // チュートリアルはヘルプコマンドで確認可能
       }
     } catch (error) {
       console.error('Budget set error:', error);
@@ -523,8 +948,7 @@ export class BudgetBot {
 
   private async handleHistory(replyToken: string, userId: string): Promise<void> {
     try {
-      // ローディングメッセージを先に送信
-      await this.pushMessage(userId, '📝 履歴を読み込んでいます...');
+      // ローディングアニメーションを表示
       await this.showLoadingAnimation(userId);
       
       const transactions = await databaseService.getRecentTransactions(userId, 10);
@@ -739,8 +1163,7 @@ export class BudgetBot {
 
   private async handleTodayBalance(replyToken: string, userId: string): Promise<void> {
     try {
-      // ローディングメッセージを先に送信
-      await this.pushMessage(userId, '📊 残高情報を取得しています...');
+      // ローディングアニメーションを表示
       await this.showLoadingAnimation(userId);
       
       const stats = await databaseService.getUserStats(userId);
@@ -2264,7 +2687,7 @@ export class BudgetBot {
     try {
       await this.client.showLoadingAnimation({
         chatId: userId,
-        loadingSeconds: 3
+        loadingSeconds: 5
       });
     } catch (error) {
       console.error('Show loading animation error:', error);
@@ -2560,8 +2983,8 @@ export class BudgetBot {
 
   private async handleTransactionEdit(replyToken: string, userId: string, transactionId: string): Promise<void> {
     try {
-      // ローディングメッセージを先に送信
-      await this.pushMessage(userId, '✏️ 取引情報を取得しています...');
+      // ローディングアニメーションを表示
+      await this.showLoadingAnimation(userId);
       
       // 取引情報を取得して表示
       const transactions = await databaseService.getRecentTransactions(userId, 50);
@@ -2590,8 +3013,8 @@ export class BudgetBot {
 
   private async handleTransactionDelete(replyToken: string, userId: string, transactionId: string): Promise<void> {
     try {
-      // ローディングメッセージを先に送信
-      await this.pushMessage(userId, '🗑️ 取引情報を確認しています...');
+      // ローディングアニメーションを表示
+      await this.showLoadingAnimation(userId);
       
       // 期限切れトークンをクリーンアップ
       this.cleanupExpiredTokens();

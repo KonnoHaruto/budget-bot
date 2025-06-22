@@ -153,6 +153,20 @@ async function handleEvent(event: line.WebhookEvent): Promise<void> {
     } catch (error) {
       console.error('❌ Postback handling error:', error);
     }
+  } else if (event.type === 'follow') {
+    try {
+      await budgetBot.handleFollow(event);
+      console.log('✅ Follow event handled successfully');
+    } catch (error) {
+      console.error('❌ Follow event handling error:', error);
+    }
+  } else if (event.type === 'unfollow') {
+    try {
+      await budgetBot.handleUnfollow(event);
+      console.log('✅ Unfollow event handled successfully');
+    } catch (error) {
+      console.error('❌ Unfollow event handling error:', error);
+    }
   } else {
     console.log('⏩ Skipping event type:', event.type);
   }
