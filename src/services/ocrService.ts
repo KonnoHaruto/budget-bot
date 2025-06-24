@@ -133,52 +133,6 @@ export class OCRService {
     }
   }
 
-  parseReceiptAmount(text: string): number | null {
-    const patterns = [
-      // 日本
-      /合計[：:\s]*[\¥\\]?([0-9,]+)/i,
-      /小計[：:\s]*[\¥\\]?([0-9,]+)/i,
-      /総額[：:\s]*[\¥\\]?([0-9,]+)/i,
-      /計[：:\s]*[\¥\\]?([0-9,]+)/i,
-      // 英語
-      /total[：:\s]*[\¥\\$]?([0-9,]+)/i,
-      /subtotal[：:\s]*[\¥\\$]?([0-9,]+)/i,
-      // その他
-      /[\¥\\$]\s*([0-9,]+)/g,
-      /([0-9,]+)\s*円/g
-    ];
-
-    const amounts: number[] = [];
-
-    for (const pattern of patterns) {
-      if (pattern.global) {
-        const matches = Array.from(text.matchAll(pattern));
-        for (const match of matches) {
-          const amountStr = match[1].replace(/,/g, '');
-          const amount = parseInt(amountStr, 10);
-          if (!isNaN(amount) && amount > 0) {
-            amounts.push(amount);
-          }
-        }
-      } else {
-        const match = text.match(pattern);
-        if (match && match[1]) {
-          const amountStr = match[1].replace(/,/g, '');
-          const amount = parseInt(amountStr, 10);
-          if (!isNaN(amount) && amount > 0) {
-            amounts.push(amount);
-          }
-        }
-      }
-    }
-
-    if (amounts.length === 0) {
-      return null;
-    }
-
-    // 最大値を返す(TODO:精度の決め手なのでロジックは今後変更)
-    return Math.max(...amounts);
-  }
 
   parseReceiptInfo(text: string): {
     amounts: ParsedAmount[];
