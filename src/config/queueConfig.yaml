@@ -1,0 +1,10 @@
+queue:
+  - name: receipt-processing-queue
+    rate: 10/s
+    max_concurrent_requests: 5
+    retry_parameters:
+      task_retry_limit: 3
+      task_age_limit: 10m
+      min_backoff: 10s
+      max_backoff: 60s
+    target: default

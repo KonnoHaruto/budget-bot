@@ -32,12 +32,70 @@ export class OCRService {
     }
   }
 
-  async extractTextFromImage(imageBuffer: Buffer): Promise<string> {
+  // 軽量OCR処理（高速化）
+  async extractTextFromImageLight(imageBuffer: Buffer, abortSignal?: AbortSignal): Promise<string> {
     if (!this.isEnabled || !this.client) {
       throw new Error('OCR service is not available. Please configure Google Cloud Vision API credentials.');
     }
 
     try {
+      // Abort チェック
+      if (abortSignal?.aborted) {
+        throw new Error('OCR processing aborted');
+      }
+
+      // 軽量画像調整（リサイズを小さく、圧縮を高く）
+      const lightImage = await sharp(imageBuffer)
+        .resize(800, 1000, { 
+          fit: 'inside',
+          withoutEnlargement: true
+        })
+        .jpeg({ quality: 75 })
+        .toBuffer();
+
+      if (abortSignal?.aborted) {
+        throw new Error('OCR processing aborted');
+      }
+
+      // 言語ヒント付きで高速処理
+      const [result] = await this.client.textDetection({
+        image: { content: lightImage },
+        imageContext: {
+          languageHints: ['ja', 'en'] // 日本語と英語に限定
+        }
+      });
+
+      if (abortSignal?.aborted) {
+        throw new Error('OCR processing aborted');
+      }
+
+      const detections = result.textAnnotations;
+      if (!detections || detections.length === 0) {
+        throw new Error('No text detected in image');
+      }
+
+      return detections[0].description || '';
+    } catch (error) {
+      if (abortSignal?.aborted) {
+        throw new Error('OCR processing aborted');
+      }
+      console.error('Light OCR Error:', error);
+      throw new Error(`Failed to extract text from image (light): ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  }
+
+  // フルOCR処理（従来版、AbortSignal対応）
+  async extractTextFromImage(imageBuffer: Buffer, abortSignal?: AbortSignal): Promise<string> {
+    if (!this.isEnabled || !this.client) {
+      throw new Error('OCR service is not available. Please configure Google Cloud Vision API credentials.');
+    }
+
+    try {
+      // Abort チェック
+      if (abortSignal?.aborted) {
+        throw new Error('OCR processing aborted');
+      }
+
       // 画像の調整
       const optimizedImage = await sharp(imageBuffer)
         .resize(1200, 1600, { 
@@ -47,10 +105,18 @@ export class OCRService {
         .jpeg({ quality: 90 })
         .toBuffer();
 
+      if (abortSignal?.aborted) {
+        throw new Error('OCR processing aborted');
+      }
+
       // 画像認識
       const [result] = await this.client.textDetection({
         image: { content: optimizedImage }
       });
+
+      if (abortSignal?.aborted) {
+        throw new Error('OCR processing aborted');
+      }
 
       const detections = result.textAnnotations;
       if (!detections || detections.length === 0) {
@@ -59,6 +125,9 @@ export class OCRService {
 
       return detections[0].description || '';
     } catch (error) {
+      if (abortSignal?.aborted) {
+        throw new Error('OCR processing aborted');
+      }
       console.error('OCR Error:', error);
       throw new Error(`Failed to extract text from image: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }

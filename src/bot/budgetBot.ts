@@ -5,6 +5,35 @@ import { CurrencyService, ParsedAmount } from '../services/currencyService';
 import { chartService, ChartData } from '../services/chartService';
 import { RichMenuService } from '../services/richMenuService';
 import { cloudTasksService } from '../services/cloudTasksService';
+import { tokenManager } from '../services/TokenManager';
+import { initializeMessageClient, getMessageClient } from '../services/MessageClient';
+import { InteractionHandler } from './InteractionHandler';
+import { receiptProcessingService } from '../services/ReceiptProcessingService';
+import { ConfirmationFlowService } from '../services/ConfirmationFlowService';
+import { 
+  LIGHT_TIMEOUT_MS, 
+  FULL_TIMEOUT_MS,
+  BUDGET_QUICK_REPLY_MIN,
+  BUDGET_QUICK_REPLY_MAX,
+  BUDGET_QUICK_REPLY_STEP,
+  BUDGET_INSTRUCTION_MIN,
+  BUDGET_INSTRUCTION_MAX,
+  BUDGET_INSTRUCTION_STEP,
+  PENDING_BUDGET_TIMEOUT_MS,
+  OCR_TEXT_PREVIEW_LENGTH,
+  OCR_TEXT_PREVIEW_LENGTH_FULL,
+  REMAINING_TIME_THRESHOLD,
+  RECENT_TRANSACTIONS_LIMIT,
+  CHART_TRANSACTIONS_LIMIT,
+  BUDGET_WARNING_THRESHOLD,
+  BUDGET_DANGER_THRESHOLD,
+  PROGRESS_BAR_TOTAL_DOTS,
+  PROGRESS_BAR_MAX_WIDTH,
+  WEEK_DAYS,
+  MILLISECONDS_PER_DAY,
+  HTTP_BAD_REQUEST,
+  COLORS
+} from '../config';
 import { PrismaClient } from '@prisma/client';
 
 type Transaction = {
@@ -34,45 +63,17 @@ interface PendingBudgetSet {
   timestamp: number;
 }
 
-interface DeleteRequest {
-  userId: string;
-  transactionId: number;
-  token: string;
-  timestamp: number;
-}
-
-interface EditRequest {
-  userId: string;
-  transactionId: number;
-  newAmount: number;
-  token: string;
-  timestamp: number;
-}
-
-interface ExpenseConfirmRequest {
-  userId: string;
-  token: string;
-  timestamp: number;
-}
-
-interface ResetConfirmRequest {
-  userId: string;
-  token: string;
-  timestamp: number;
-}
 
 
 export class BudgetBot {
   private client: line.messagingApi.MessagingApiClient;
   private blobClient: line.messagingApi.MessagingApiBlobClient;
   private richMenuService: RichMenuService;
+  private interactionHandler: InteractionHandler;
+  private confirmationFlowService: ConfirmationFlowService;
   private pendingTransactions: Map<string, PendingTransaction> = new Map();
   private pendingEdits: Map<string, PendingEdit> = new Map();
   private pendingBudgetSets: Map<string, PendingBudgetSet> = new Map();
-  private deleteRequests: Map<string, DeleteRequest> = new Map();
-  private editRequests: Map<string, EditRequest> = new Map();
-  private expenseConfirmRequests: Map<string, ExpenseConfirmRequest> = new Map();
-  private resetConfirmRequests: Map<string, ResetConfirmRequest> = new Map();
 
   constructor() {
     const config = {
@@ -82,6 +83,15 @@ export class BudgetBot {
     this.client = new line.messagingApi.MessagingApiClient(config);
     this.blobClient = new line.messagingApi.MessagingApiBlobClient(config);
     this.richMenuService = new RichMenuService(this.client);
+    
+    // MessageClientを初期化
+    initializeMessageClient(this.client);
+    
+    // InteractionHandlerを初期化
+    this.interactionHandler = new InteractionHandler(this);
+    
+    // ConfirmationFlowServiceを初期化
+    this.confirmationFlowService = new ConfirmationFlowService(this);
   }
 
   async initializeRichMenu(): Promise<void> {
@@ -93,9 +103,46 @@ export class BudgetBot {
     }
   }
 
-  private generateDeleteToken(): string {
-    return Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
+  // 状態管理メソッド
+  public getPendingEdit(userId: string): PendingEdit | undefined {
+    return this.pendingEdits.get(userId);
   }
+
+  public removePendingEdit(userId: string): void {
+    this.pendingEdits.delete(userId);
+  }
+
+  public getPendingBudgetSet(userId: string): PendingBudgetSet | undefined {
+    return this.pendingBudgetSets.get(userId);
+  }
+
+  public removePendingBudgetSet(userId: string): void {
+    this.pendingBudgetSets.delete(userId);
+  }
+
+  public isPendingBudgetValid(pendingBudget: PendingBudgetSet): boolean {
+    return (Date.now() - pendingBudget.timestamp) < PENDING_BUDGET_TIMEOUT_MS;
+  }
+
+  public async ensureUserExists(userId: string): Promise<void> {
+    let user = await databaseService.getUser(userId);
+    if (!user) {
+      user = await databaseService.createUser(userId);
+    }
+  }
+
+  public async enqueueReceiptProcessing(params: { userId: string; messageId: string; replyToken: string }): Promise<void> {
+    await cloudTasksService.enqueueReceiptProcessing(params);
+  }
+
+  public getPendingTransaction(userId: string): PendingTransaction | undefined {
+    return this.pendingTransactions.get(userId);
+  }
+
+  public removePendingTransaction(userId: string): void {
+    this.pendingTransactions.delete(userId);
+  }
+
 
   // Cloud Tasks用のパブリックメソッド
   public getBlobClient(): line.messagingApi.MessagingApiBlobClient {
@@ -103,14 +150,7 @@ export class BudgetBot {
   }
 
   public async generateExpenseToken(userId: string): Promise<string> {
-    this.cleanupExpiredTokens();
-    const token = this.generateDeleteToken();
-    this.expenseConfirmRequests.set(token, {
-      userId,
-      token,
-      timestamp: Date.now()
-    });
-    return token;
+    return await tokenManager.generateExpenseToken(userId);
   }
 
   public async savePendingTransaction(userId: string, transaction: PendingTransaction): Promise<void> {
@@ -128,152 +168,25 @@ export class BudgetBot {
     return this.createReceiptConfirmationCard(amount, originalAmount, currency, rate, storeName, token);
   }
 
-  private cleanupExpiredTokens(): void {
-    const now = Date.now();
-    const EXPIRY_TIME = 5 * 60 * 1000; // 5分
 
-    // 削除リクエストのクリーンアップ
-    for (const [token, request] of this.deleteRequests.entries()) {
-      if (now - request.timestamp > EXPIRY_TIME) {
-        this.deleteRequests.delete(token);
-      }
-    }
-
-    // 編集リクエストのクリーンアップ
-    for (const [token, request] of this.editRequests.entries()) {
-      if (now - request.timestamp > EXPIRY_TIME) {
-        this.editRequests.delete(token);
-      }
-    }
-
-    // 支出確認リクエストのクリーンアップ
-    for (const [token, request] of this.expenseConfirmRequests.entries()) {
-      if (now - request.timestamp > EXPIRY_TIME) {
-        this.expenseConfirmRequests.delete(token);
-      }
-    }
-
-    // リセット確認リクエストのクリーンアップ
-    for (const [token, request] of this.resetConfirmRequests.entries()) {
-      if (now - request.timestamp > EXPIRY_TIME) {
-        this.resetConfirmRequests.delete(token);
-      }
-    }
-  }
-
+  // イベント処理をInteractionHandlerに委譲
   async handleMessage(event: line.MessageEvent): Promise<void> {
-    const { replyToken, source } = event;
-    const userId = source.userId;
-
-    if (!userId) return;
-
-    // Ensure user exists in database
-    let user = await databaseService.getUser(userId);
-    if (!user) {
-      user = await databaseService.createUser(userId);
-    }
-
-    switch (event.message.type) {
-      case 'text':
-        await this.handleTextMessage(replyToken, userId, event.message.text);
-        break;
-      case 'image':
-        await this.handleImageMessage(replyToken, userId, event.message.id);
-        break;
-      default:
-        await this.replyMessage(replyToken, 'テキストメッセージまたは画像を送信してください。');
-    }
+    await this.interactionHandler.handleMessage(event);
   }
 
   async handlePostback(event: line.PostbackEvent): Promise<void> {
-    const { replyToken, source, postback } = event;
-    const userId = source.userId;
-
-    if (!userId) return;
-
-    const data = postback.data;
-    
-    if (data.startsWith('confirm_delete_')) {
-      const token = data.replace('confirm_delete_', '');
-      await this.handleTransactionDeleteConfirm(replyToken, userId, token);
-    } else if (data.startsWith('cancel_delete_')) {
-      const token = data.replace('cancel_delete_', '');
-      await this.handleDeleteCancel(replyToken, token);
-    } else if (data.startsWith('confirm_edit_')) {
-      const token = data.replace('confirm_edit_', '');
-      await this.handleEditConfirm(replyToken, userId, token);
-    } else if (data.startsWith('cancel_edit_')) {
-      const token = data.replace('cancel_edit_', '');
-      await this.handleEditCancel(replyToken, token);
-    } else if (data.startsWith('confirm_reset_')) {
-      const token = data.replace('confirm_reset_', '');
-      await this.handleResetConfirm(replyToken, userId, token);
-    } else if (data.startsWith('cancel_reset_')) {
-      const token = data.replace('cancel_reset_', '');
-      await this.handleResetCancel(replyToken, token);
-    } else if (data.startsWith('confirm_expense_')) {
-      const token = data.replace('confirm_expense_', '');
-      await this.handleExpenseConfirm(replyToken, userId, token);
-    } else if (data.startsWith('cancel_expense_')) {
-      const token = data.replace('cancel_expense_', '');
-      await this.handleExpenseCancel(replyToken, token);
-    } else if (data.startsWith('menu_')) {
-      await this.handleMenuAction(replyToken, userId, data);
-    } else if (data.startsWith('edit_transaction_')) {
-      const transactionId = data.replace('edit_transaction_', '');
-      await this.handleTransactionEdit(replyToken, userId, transactionId);
-    } else if (data.startsWith('delete_transaction_')) {
-      const transactionId = data.replace('delete_transaction_', '');
-      await this.handleTransactionDelete(replyToken, userId, transactionId);
-    } else if (data === 'receipt_edit') {
-      await this.handleReceiptEdit(replyToken, userId);
-    } else if (data === 'cancel_edit' || data === 'cancel_delete') {
-      await this.replyMessage(replyToken, '❌ 操作をキャンセルしました。');
-    }
+    await this.interactionHandler.handlePostback(event);
   }
 
   async handleFollow(event: line.FollowEvent): Promise<void> {
-    const userId = event.source.userId;
-    const replyToken = event.replyToken;
-    
-    if (!userId) {
-      console.log('⚠️ Follow event received but no userId found');
-      return;
-    }
-
-    console.log(`👋 New user followed: ${userId}`);
-    console.log('📋 Follow event details:', JSON.stringify(event, null, 2));
-
-    try {
-      // ユーザーをデータベースに作成
-      let user = await databaseService.getUser(userId);
-      if (!user) {
-        console.log(`🆕 Creating new user: ${userId}`);
-        user = await databaseService.createUser(userId);
-        console.log(`✅ New user created:`, user);
-      } else {
-        console.log(`👤 Existing user found:`, user);
-      }
-
-      // ウェルカムメッセージを送信（Reply Messageとして）
-      console.log(`📧 Calling sendWelcomeMessage for user: ${userId} with replyToken: ${replyToken}`);
-      await this.sendWelcomeMessage(userId, replyToken);
-      console.log(`✅ handleFollow completed for user: ${userId}`);
-      
-    } catch (error) {
-      console.error(`❌ Error in handleFollow for user ${userId}:`, error);
-    }
+    await this.interactionHandler.handleFollow(event);
   }
 
   async handleUnfollow(event: line.UnfollowEvent): Promise<void> {
-    const userId = event.source.userId;
-    if (!userId) return;
-
-    console.log(`👋 User unfollowed: ${userId}`);
-    // アンフォロー時の処理（必要に応じて）
+    await this.interactionHandler.handleUnfollow(event);
   }
 
-  private async sendWelcomeMessage(userId: string, replyToken?: string): Promise<void> {
+  public async sendWelcomeMessage(userId: string, replyToken?: string): Promise<void> {
     try {
       console.log(`📧 Sending welcome message to user: ${userId}`);
       
@@ -287,9 +200,9 @@ export class BudgetBot {
       // Flex Messageでウェルカムメッセージを作成
       const welcomeCard = this.createWelcomeBudgetCard();
       
-      // Quick Replyオプションを作成（30,000円から100,000円まで10,000円刻み）
+      // Quick Replyオプションを作成
       const quickReplyItems = [];
-      for (let amount = 30000; amount <= 100000; amount += 10000) {
+      for (let amount = BUDGET_QUICK_REPLY_MIN; amount <= BUDGET_QUICK_REPLY_MAX; amount += BUDGET_QUICK_REPLY_STEP) {
         quickReplyItems.push({
           type: "action",
           action: {
@@ -338,7 +251,7 @@ export class BudgetBot {
             '🎉 予算管理ボットへようこそ！\n\n' +
             'まずは月間予算を設定しましょう。\n' +
             '金額を数字で入力してください。\n\n' +
-            '例: 50000'
+            '例: ' + BUDGET_QUICK_REPLY_MIN
           );
           console.log(`✅ Fallback welcome reply message sent to ${userId}`);
         } else {
@@ -650,115 +563,285 @@ export class BudgetBot {
     };
   }
 
-  private async handleTextMessage(replyToken: string, userId: string, text: string): Promise<void> {
-    const command = text.toLowerCase().trim();
 
-    // 編集待機状態のチェック
-    const pendingEdit = this.pendingEdits.get(userId);
-    if (pendingEdit) {
-      const amount = this.parseAmount(text);
-      if (amount > 0) {
-        await this.handleDirectEditAmount(replyToken, userId, pendingEdit.transactionId, amount);
-        this.pendingEdits.delete(userId);
-        return;
-      } else {
-        await this.replyMessage(replyToken, '❌ 正しい金額を入力してください。例: "2500"');
-        return;
-      }
-    }
-
-    // 確認応答のチェック
-    if (command === 'はい' || command === 'yes' || command === 'ok' || command === '確定') {
-      await this.handleConfirmation(replyToken, userId, true);
-      return;
-    } else if (command === 'いいえ' || command === 'no' || command === 'キャンセル') {
-      await this.handleConfirmation(replyToken, userId, false);
-      return;
-    }
-
-    // リッチメニューからのメッセージ処理
-    if (command === '予算設定') {
-      await this.handleBudgetSetInstruction(replyToken, userId);
-    } else if (command === '今日の残高') {
-      await this.handleTodayBalance(replyToken, userId);
-    } else if (command === '履歴') {
-      await this.handleHistory(replyToken, userId);
-    } else if (command === 'レポート') {
-      await this.handleReport(replyToken, userId);
-    } else if (command === 'ヘルプ') {
-      await this.handleHelp(replyToken);
-    } else if (command.startsWith('予算設定') || command.startsWith('budget set')) {
-      await this.handleBudgetSet(replyToken, userId, text);
-    } else if (command === '予算確認' || command === 'budget' || command === 'status') {
-      await this.handleBudgetStatus(replyToken, userId);
-    } else if (command === 'リセット' || command === 'reset') {
-      await this.handleBudgetReset(replyToken, userId);
-    } else if (text.startsWith('edit ')) {
-      // 取引編集コマンド: "edit transactionId newAmount"
-      await this.handleEditCommand(replyToken, userId, text);
-    } else {
-      // Check if user is in budget setting mode
-      const pendingBudget = this.pendingBudgetSets.get(userId);
-      if (pendingBudget && (Date.now() - pendingBudget.timestamp) < 300000) { // 5分以内
-        const amount = this.parseAmount(text);
-        if (amount > 0) {
-          // Process as budget setting
-          this.pendingBudgetSets.delete(userId);
-          await this.handleBudgetSet(replyToken, userId, amount.toString());
-          return;
-        } else {
-          await this.replyMessage(replyToken, '❌ 有効な金額を入力してください。数字のみで入力してください。\n例: 50000');
-          return;
-        }
-      }
-      
-      // Try to parse as manual expense entry
-      const amount = this.parseAmount(text);
-      if (amount > 0) {
-        await this.handleManualExpenseConfirmation(replyToken, userId, amount, `手動入力: ${text}`);
-      } else {
-        await this.handleHelp(replyToken);
-      }
-    }
-  }
-
-  private async handleImageMessage(replyToken: string, userId: string, messageId: string): Promise<void> {
+  // 時間制限付きレシート処理メソッド（改善版）
+  public async tryProcessReceiptWithTimeout(userId: string, messageId: string, replyToken: string): Promise<boolean> {
+    const startTime = Date.now();
+    
+    // AbortControllerでキャンセル制御
+    const abortController = new AbortController();
+    
     try {
-      // Send processing started message immediately
-      await this.replyMessage(replyToken, '処理を開始しました。');
-      console.log(`🚀 Processing started message sent for user: ${userId}`);
-
-      // Enqueue receipt processing task to Cloud Tasks
-      await cloudTasksService.enqueueReceiptProcessing({
-        userId,
-        messageId,
-        replyToken
-      });
-
-      console.log(`📝 Receipt processing task enqueued for user: ${userId}, messageId: ${messageId}`);
-
-    } catch (error) {
-      console.error('❌ Failed to enqueue receipt processing task:', error);
+      console.log(`⏱️ Starting 2-stage receipt processing for user: ${userId}`);
       
-      // Fallback error message
-      let errorMessage = '❌ 処理の開始に失敗しました。手動で金額を入力してください。\n例: "1500" または "1500円"';
+      // ステージ1: 軽量OCR処理（1秒制限）
+      console.log(`📸 Stage 1: Light OCR processing (${LIGHT_TIMEOUT_MS}ms timeout)...`);
       
-      if (error instanceof Error) {
-        if (error.message.includes('Cloud Tasks')) {
-          errorMessage = '❌ 処理システムが一時的に利用できません。しばらく待ってから再度お試しください。';
-        }
+      const lightResult = await Promise.race([
+        this.tryLightOCRProcessing(userId, messageId, replyToken, abortController.signal),
+        new Promise<'timeout'>((resolve) => {
+          setTimeout(() => resolve('timeout'), LIGHT_TIMEOUT_MS);
+        })
+      ]);
+      
+      if (lightResult === 'success') {
+        const elapsedTime = Date.now() - startTime;
+        console.log(`✅ Receipt processed successfully in light mode within ${elapsedTime}ms`);
+        return true;
+      } else if (lightResult === 'timeout') {
+        console.log(`⏰ Light OCR timed out after ${LIGHT_TIMEOUT_MS}ms, trying full processing...`);
       }
       
-      await this.replyMessage(replyToken, errorMessage);
+      // ステージ2: フル処理（残り時間での制限）
+      const remainingTime = FULL_TIMEOUT_MS - (Date.now() - startTime);
+      if (remainingTime <= REMAINING_TIME_THRESHOLD) {
+        console.log(`⏰ Insufficient time remaining (${remainingTime}ms), falling back to Cloud Tasks`);
+        return false;
+      }
+      
+      console.log(`🔄 Stage 2: Full processing (${remainingTime}ms remaining)...`);
+      
+      const fullResult = await Promise.race([
+        this.processReceiptInWebhook(userId, messageId, replyToken, abortController.signal),
+        new Promise<'timeout'>((resolve) => {
+          setTimeout(() => resolve('timeout'), remainingTime);
+        })
+      ]);
+      
+      if (fullResult === 'success') {
+        const elapsedTime = Date.now() - startTime;
+        console.log(`✅ Receipt processed successfully in full mode within ${elapsedTime}ms`);
+        return true;
+      } else {
+        console.log(`⏰ Full processing timed out, falling back to Cloud Tasks`);
+        return false;
+      }
+      
+    } catch (error: any) {
+      const elapsedTime = Date.now() - startTime;
+      console.error(`❌ Receipt processing failed in webhook after ${elapsedTime}ms:`, error);
+      
+      // エラー時は即座にフォールバックメッセージを送信
+      try {
+        const fallbackMessage = '⚠️ レシート処理中にエラーが発生しました。バックグラウンドで再試行しています...';
+        await this.replyMessage(replyToken, fallbackMessage);
+        console.log(`📤 Sent error fallback message to user ${userId}`);
+      } catch (replyError) {
+        console.error(`❌ Failed to send error fallback message:`, replyError);
+      }
+      
+      return false; // Cloud Tasksでリトライ
+    } finally {
+      // 必ずAbort処理を実行
+      abortController.abort();
     }
   }
 
-  private async handleBudgetSet(replyToken: string, userId: string, text: string): Promise<void> {
+  // 軽量OCR処理（高速化＋キャンセル対応）
+  private async tryLightOCRProcessing(userId: string, messageId: string, replyToken: string, abortSignal: AbortSignal): Promise<'success' | 'error'> {
+    console.log(`🚀 Starting light OCR processing for user: ${userId}`);
+
+    try {
+      // Abort チェック
+      if (abortSignal.aborted) return 'error';
+
+      // 新しいReceiptProcessingServiceを使用
+      const { receiptInfo, currencyResult } = await receiptProcessingService.processReceiptWorkflow(
+        messageId,
+        this.blobClient,
+        'light',
+        abortSignal
+      );
+
+      // ログ出力
+      receiptProcessingService.logProcessingResult('light', receiptInfo, currencyResult);
+
+      if (receiptInfo.amounts && receiptInfo.amounts.length > 0) {
+        console.log(`💱 Light OCR found ${receiptInfo.amounts.length} amounts, processing...`);
+        
+        return await this.completeReceiptProcessing(
+          userId, 
+          { amounts: receiptInfo.amounts, storeName: receiptInfo.storeName, items: receiptInfo.items }, 
+          replyToken, 
+          abortSignal, 
+          'light'
+        );
+      } else {
+        console.log('⚠️ Light OCR: No amounts found, will try full processing');
+        return 'error';
+      }
+      
+    } catch (error: any) {
+      if (abortSignal.aborted) {
+        console.log('🛑 Light OCR processing aborted');
+        return 'error';
+      }
+      
+      const errorInfo = receiptProcessingService.handleProcessingError(error, 'Light OCR processing');
+      console.error(`❌ Light OCR processing failed:`, error);
+      return 'error';
+    }
+  }
+
+  // フル処理（改善版）
+  private async processReceiptInWebhook(userId: string, messageId: string, replyToken: string, abortSignal: AbortSignal): Promise<'success' | 'error'> {
+    console.log(`📷 Starting full webhook receipt processing for user: ${userId}, messageId: ${messageId}`);
+
+    try {
+      // Abort チェック
+      if (abortSignal.aborted) return 'error';
+
+      // 新しいReceiptProcessingServiceを使用
+      const { receiptInfo, currencyResult } = await receiptProcessingService.processReceiptWorkflow(
+        messageId,
+        this.blobClient,
+        'full',
+        abortSignal
+      );
+
+      // ログ出力
+      receiptProcessingService.logProcessingResult('full', receiptInfo, currencyResult);
+
+      if (receiptInfo.amounts && receiptInfo.amounts.length > 0) {
+        console.log(`💱 Full OCR found ${receiptInfo.amounts.length} amounts, processing...`);
+        
+        return await this.completeReceiptProcessing(
+          userId, 
+          { amounts: receiptInfo.amounts, storeName: receiptInfo.storeName, items: receiptInfo.items }, 
+          replyToken, 
+          abortSignal, 
+          'full'
+        );
+      } else {
+        console.log('⚠️ Full OCR: No amounts found in receipt');
+        if (!abortSignal.aborted) {
+          const messageClient = getMessageClient();
+          const noAmountMessage = '⚠️ レシートから金額を読み取れませんでした。\n手動で金額を入力してください。\n例: "1500" または "1500円"';
+          await messageClient.replyMessage(replyToken, noAmountMessage, userId);
+        }
+        return 'error';
+      }
+      
+    } catch (error: any) {
+      if (abortSignal.aborted) {
+        console.log('🛑 Full OCR processing aborted');
+        return 'error';
+      }
+      
+      // エラーハンドリング統一
+      const errorInfo = receiptProcessingService.handleProcessingError(error, 'Full OCR processing');
+      
+      if (!abortSignal.aborted && errorInfo.isTimeout) {
+        const messageClient = getMessageClient();
+        await messageClient.replyMessage(replyToken, errorInfo.message, userId);
+      }
+      
+      console.error(`❌ Full OCR processing failed:`, error);
+      return 'error';
+    }
+  }
+
+  // レシート処理の完了部分（共通化）
+  private async completeReceiptProcessing(
+    userId: string, 
+    receiptInfo: any, 
+    replyToken: string, 
+    abortSignal: AbortSignal,
+    mode: 'light' | 'full'
+  ): Promise<'success' | 'error'> {
+    try {
+      if (abortSignal.aborted) return 'error';
+
+      // 最大金額を選択
+      const mainAmount = receiptInfo.amounts.sort((a: any, b: any) => b.amount - a.amount)[0];
+      console.log(`💰 ${mode} processing - Main amount detected:`, mainAmount);
+      
+      // 日本円に変換
+      if (abortSignal.aborted) return 'error';
+      console.log(`💱 ${mode} processing - Converting to JPY...`);
+      const conversionResult = await CurrencyService.convertToJPY(
+        mainAmount.amount, 
+        mainAmount.currency.code
+      );
+      
+      if (abortSignal.aborted) return 'error';
+      console.log(`✅ ${mode} processing - Conversion result:`, conversionResult);
+      
+      // 変換後の金額を追加
+      mainAmount.convertedAmount = conversionResult.convertedAmount;
+      
+      // ワンタイムトークン生成
+      const token = await this.generateExpenseToken(userId);
+
+      // 保留中取引として保存
+      await this.savePendingTransaction(userId, {
+        userId,
+        parsedAmounts: [mainAmount],
+        storeName: receiptInfo.storeName || null,
+        timestamp: Date.now()
+      });
+      console.log(`💾 ${mode} processing - Pending transaction saved in webhook`);
+      
+      if (abortSignal.aborted) return 'error';
+      
+      // Flex Messageで確認画面を送信（エラーハンドリング改善）
+      const confirmationCard = await this.createConfirmationCard(
+        conversionResult.convertedAmount,
+        mainAmount.currency.code !== 'JPY' ? mainAmount.amount : undefined,
+        mainAmount.currency.code !== 'JPY' ? mainAmount.currency.code : undefined,
+        mainAmount.currency.code !== 'JPY' ? conversionResult.rate : undefined,
+        receiptInfo.storeName || undefined,
+        token
+      );
+      
+      if (abortSignal.aborted) return 'error';
+      
+      console.log(`📤 ${mode} processing - Sending confirmation flex message via reply...`);
+      
+      try {
+        await this.replyFlexMessage(replyToken, '💰 支出確認', confirmationCard);
+        console.log(`✅ ${mode} processing - Confirmation sent via reply message successfully`);
+        return 'success';
+      } catch (replyError: any) {
+        console.error(`❌ ${mode} processing - Reply flex message failed:`, replyError);
+        
+        // replyTokenが無効な場合のフォールバック
+        if (replyError.status === HTTP_BAD_REQUEST && replyError.body?.includes('Invalid reply token')) {
+          console.log(`🔄 ${mode} processing - Falling back to push message due to invalid reply token`);
+          try {
+            await this.pushFlexMessage(userId, '💰 支出確認', confirmationCard);
+            console.log(`✅ ${mode} processing - Confirmation sent via push message (fallback)`);
+            return 'success';
+          } catch (pushError: any) {
+            console.error(`❌ ${mode} processing - Push flex message also failed:`, pushError);
+            
+            // 最終フォールバック: テキストメッセージ
+            const fallbackText = `💰 支出確認\n\n店舗: ${receiptInfo.storeName || '不明'}\n金額: ¥${conversionResult.convertedAmount.toLocaleString()}\n\n追加しますか？\n「はい」または「いいえ」で回答してください。`;
+            await this.pushMessage(userId, fallbackText);
+            console.log(`✅ ${mode} processing - Sent fallback text message`);
+            return 'success';
+          }
+        } else {
+          throw replyError;
+        }
+      }
+      
+    } catch (error: any) {
+      if (abortSignal.aborted) {
+        console.log(`🛑 ${mode} processing - Receipt completion aborted`);
+        return 'error';
+      }
+      console.error(`❌ ${mode} processing - Receipt completion failed:`, error);
+      return 'error';
+    }
+  }
+
+  public async handleBudgetSet(replyToken: string, userId: string, text: string): Promise<void> {
     const amount = this.parseAmount(text);
     if (amount <= 0) {
       await this.replyMessage(
         replyToken,
-        '❌ 有効な金額を入力してください。\n例: "予算設定 50000" または "budget set 50000"'
+        '❌ 有効な金額を入力してください。\n例: "予算設定 ' + BUDGET_QUICK_REPLY_MIN + '" または "budget set ' + BUDGET_QUICK_REPLY_MIN + '"'
       );
       return;
     }
@@ -789,7 +872,7 @@ export class BudgetBot {
     }
   }
 
-  private async handleBudgetStatus(replyToken: string, userId: string): Promise<void> {
+  public async handleBudgetStatus(replyToken: string, userId: string): Promise<void> {
     try {
       // ローディングアニメーション表示
       await this.showLoadingAnimation(userId);
@@ -903,15 +986,8 @@ export class BudgetBot {
     };
   }
 
-  private async handleBudgetReset(replyToken: string, userId: string): Promise<void> {
-    this.cleanupExpiredTokens();
-    
-    const token = this.generateDeleteToken();
-    this.resetConfirmRequests.set(token, {
-      userId,
-      token,
-      timestamp: Date.now()
-    });
+  public async handleBudgetReset(replyToken: string, userId: string): Promise<void> {
+    const token = tokenManager.generateResetToken(userId);
 
     // リセット警告メッセージを表示
     const warningMessage = '⚠️ 重要な警告\n\n' +
@@ -946,7 +1022,7 @@ export class BudgetBot {
     }
   }
 
-  private async handleHistory(replyToken: string, userId: string): Promise<void> {
+  public async handleHistory(replyToken: string, userId: string): Promise<void> {
     try {
       // ローディングアニメーションを表示
       await this.showLoadingAnimation(userId);
@@ -967,7 +1043,7 @@ export class BudgetBot {
     }
   }
 
-  private async handleHelp(replyToken: string): Promise<void> {
+  public async handleHelp(replyToken: string): Promise<void> {
     const helpCard = {
       type: "bubble",
       header: {
@@ -1161,7 +1237,7 @@ export class BudgetBot {
   }
 
 
-  private async handleTodayBalance(replyToken: string, userId: string): Promise<void> {
+  public async handleTodayBalance(replyToken: string, userId: string): Promise<void> {
     try {
       // ローディングアニメーションを表示
       await this.showLoadingAnimation(userId);
@@ -1181,7 +1257,7 @@ export class BudgetBot {
     }
   }
 
-  private async handleReport(replyToken: string, userId: string): Promise<void> {
+  public async handleReport(replyToken: string, userId: string): Promise<void> {
     const message = `📈 レポート機能\n\n` +
       `週間・月間の詳細なレポート機能は\n` +
       `現在開発中です。\n\n` +
@@ -1194,7 +1270,7 @@ export class BudgetBot {
     await this.replyMessage(replyToken, message);
   }
 
-  private async handleBudgetSetInstruction(replyToken: string, userId?: string): Promise<void> {
+  public async handleBudgetSetInstruction(replyToken: string, userId?: string): Promise<void> {
     // 予算設定待機状態を設定
     if (userId) {
       this.pendingBudgetSets.set(userId, {
@@ -1297,9 +1373,9 @@ export class BudgetBot {
       }
     };
 
-    // クイックリプライオプションを作成（40,000円から100,000円まで10,000円刻み）
+    // クイックリプライオプションを作成
     const quickReplyItems = [];
-    for (let amount = 40000; amount <= 100000; amount += 10000) {
+    for (let amount = BUDGET_INSTRUCTION_MIN; amount <= BUDGET_INSTRUCTION_MAX; amount += BUDGET_INSTRUCTION_STEP) {
       quickReplyItems.push({
         type: "action",
         action: {
@@ -1329,7 +1405,7 @@ export class BudgetBot {
   }
 
 
-  private async addExpense(replyToken: string, userId: string, amount: number, description: string): Promise<void> {
+  public async addExpense(replyToken: string, userId: string, amount: number, description: string): Promise<void> {
     try {
       await databaseService.addTransaction(userId, amount, description);
       const stats = await databaseService.getUserStats(userId);
@@ -1339,8 +1415,8 @@ export class BudgetBot {
         return;
       }
 
-      const statusEmoji = stats.budgetUsagePercentage > 100 ? '🚨' : 
-                         stats.budgetUsagePercentage > 80 ? '⚠️' : '✅';
+      const statusEmoji = stats.budgetUsagePercentage > BUDGET_DANGER_THRESHOLD ? '🚨' : 
+                         stats.budgetUsagePercentage > BUDGET_WARNING_THRESHOLD ? '⚠️' : '✅';
 
       const message = `${statusEmoji} 支出を記録しました\n\n` +
         `💸 支出: ${amount.toLocaleString()}円\n` +
@@ -1357,7 +1433,7 @@ export class BudgetBot {
     }
   }
 
-  private parseAmount(text: string): number {
+  public parseAmount(text: string): number {
     // Remove common prefixes and suffixes
     const cleanText = text.replace(/予算設定|budget set|円|¥|\$/gi, '').trim();
     
@@ -1399,7 +1475,7 @@ export class BudgetBot {
     weekEnd.setHours(23, 59, 59, 999);
     
     // 今週は何日あるか（月の境界を考慮）
-    const daysInCurrentWeek = Math.min(7, Math.ceil((weekEnd.getTime() - weekStart.getTime()) / (1000 * 60 * 60 * 24)) + 1);
+    const daysInCurrentWeek = Math.min(WEEK_DAYS, Math.ceil((weekEnd.getTime() - weekStart.getTime()) / MILLISECONDS_PER_DAY) + 1);
     
     // 日毎予算計算（改善版）
     const dailyBudget = monthlyBudget / daysInMonth; // 1日あたりの予算
@@ -1439,16 +1515,15 @@ export class BudgetBot {
   }
 
   private createProgressIndicator(percentage: number): string {
-    const totalDots = 10;
-    const filledDots = Math.min(Math.round((percentage / 100) * totalDots), totalDots);
-    const emptyDots = totalDots - filledDots;
+    const filledDots = Math.min(Math.round((percentage / 100) * PROGRESS_BAR_TOTAL_DOTS), PROGRESS_BAR_TOTAL_DOTS);
+    const emptyDots = PROGRESS_BAR_TOTAL_DOTS - filledDots;
     
     return '●'.repeat(filledDots) + '○'.repeat(emptyDots);
   }
 
   private createProgressBar(percentage: number, color: string): any {
-    const filledWidth = Math.max(1, Math.min(Math.round(percentage), 100));
-    const remainingWidth = Math.max(1, 100 - filledWidth);
+    const filledWidth = Math.max(1, Math.min(Math.round(percentage), PROGRESS_BAR_MAX_WIDTH));
+    const remainingWidth = Math.max(1, PROGRESS_BAR_MAX_WIDTH - filledWidth);
     
     return {
       type: 'box',
@@ -2594,7 +2669,7 @@ export class BudgetBot {
       if (!user) return 0;
 
       // 簡易版：その日の取引を合計. 今後より詳細に
-      const transactions = await databaseService.getRecentTransactions(userId, 100);
+      const transactions = await databaseService.getRecentTransactions(userId, CHART_TRANSACTIONS_LIMIT);
       return transactions
         .filter((t: Transaction) => {
           const transactionDate = new Date(t.createdAt);
@@ -2624,74 +2699,30 @@ export class BudgetBot {
     return analysis;
   }
 
-  private async replyMessage(replyToken: string, text: string): Promise<void> {
-    try {
-      await this.client.replyMessage({
-        replyToken,
-        messages: [{
-          type: 'text',
-          text
-        }]
-      });
-    } catch (error) {
-      console.error('Reply message error:', error);
-    }
+  async replyMessage(replyToken: string, text: string, userId?: string): Promise<void> {
+    const messageClient = getMessageClient();
+    await messageClient.replyMessage(replyToken, text, userId);
   }
 
   async pushMessage(userId: string, text: string): Promise<void> {
-    try {
-      await this.client.pushMessage({
-        to: userId,
-        messages: [{
-          type: 'text',
-          text
-        }]
-      });
-    } catch (error) {
-      console.error('Push message error:', error);
-    }
+    const messageClient = getMessageClient();
+    await messageClient.pushMessage(userId, text);
   }
 
 
-  private async replyFlexMessage(replyToken: string, altText: string, flexContent: any): Promise<void> {
-    try {
-      await this.client.replyMessage({
-        replyToken,
-        messages: [{
-          type: 'flex',
-          altText,
-          contents: flexContent
-        }]
-      });
-    } catch (error) {
-      console.error('Reply flex message error:', error);
-    }
+  async replyFlexMessage(replyToken: string, altText: string, flexContent: any, userId?: string): Promise<void> {
+    const messageClient = getMessageClient();
+    await messageClient.replyFlexMessage(replyToken, altText, flexContent, userId);
   }
 
   async pushFlexMessage(userId: string, altText: string, flexContent: any): Promise<void> {
-    try {
-      await this.client.pushMessage({
-        to: userId,
-        messages: [{
-          type: 'flex',
-          altText,
-          contents: flexContent
-        }]
-      });
-    } catch (error) {
-      console.error('Push flex message error:', error);
-    }
+    const messageClient = getMessageClient();
+    await messageClient.pushFlexMessage(userId, altText, flexContent);
   }
 
   async showLoadingAnimation(userId: string): Promise<void> {
-    try {
-      await this.client.showLoadingAnimation({
-        chatId: userId,
-        loadingSeconds: 5
-      });
-    } catch (error) {
-      console.error('Show loading animation error:', error);
-    }
+    const messageClient = getMessageClient();
+    await messageClient.showLoadingAnimation(userId);
   }
 
   private async pushButtonsMessage(
@@ -2700,43 +2731,8 @@ export class BudgetBot {
     text: string, 
     actions: { label: string; data: string }[]
   ): Promise<void> {
-    try {
-      console.log('🔄 Sending buttons message:', {
-        userId,
-        title,
-        text: text.substring(0, 100) + '...',
-        actionsCount: actions.length
-      });
-      
-      // LINE Buttonsテンプレートの制限事項を考慮
-      const truncatedTitle = title.length > 40 ? title.substring(0, 37) + '...' : title;
-      const truncatedText = text.length > 60 ? text.substring(0, 57) + '...' : text;
-      
-      await this.client.pushMessage({
-        to: userId,
-        messages: [{
-          type: 'template',
-          altText: title,
-          template: {
-            type: 'buttons',
-            title: truncatedTitle,
-            text: truncatedText,
-            actions: actions.map(action => ({
-              type: 'postback',
-              label: action.label,
-              data: action.data
-            }))
-          }
-        }]
-      });
-      
-      console.log('✅ Buttons message sent successfully');
-    } catch (error) {
-      console.error('❌ Push buttons message error:', error);
-      if (error instanceof Error) {
-        console.error('Error details:', error.message);
-      }
-    }
+    const messageClient = getMessageClient();
+    await messageClient.pushButtonsMessage(userId, title, text, actions);
   }
 
   private async processReceiptAmounts(userId: string, amounts: ParsedAmount[], storeName: string | null): Promise<void> {
@@ -2759,13 +2755,7 @@ export class BudgetBot {
       mainAmount.convertedAmount = conversionResult.convertedAmount;
       
       // ワンタイムトークン生成
-      this.cleanupExpiredTokens();
-      const token = this.generateDeleteToken();
-      this.expenseConfirmRequests.set(token, {
-        userId,
-        token,
-        timestamp: Date.now()
-      });
+      const token = await tokenManager.generateExpenseToken(userId);
 
       // 保留中取引として保存
       this.pendingTransactions.set(userId, {
@@ -2799,32 +2789,11 @@ export class BudgetBot {
     }
   }
 
-  private async handleConfirmation(replyToken: string, userId: string, confirmed: boolean): Promise<void> {
-    const pending = this.pendingTransactions.get(userId);
-    
-    if (!pending) {
-      await this.replyMessage(replyToken, '⚠️ 確認待ちの取引がありません。');
-      return;
-    }
-    
-    // 保留中の取引を削除
-    this.pendingTransactions.delete(userId);
-    
-    if (confirmed) {
-      const mainAmount = pending.parsedAmounts[0];
-      const jpyAmount = mainAmount.convertedAmount || mainAmount.amount;
-      
-      const description = pending.storeName 
-        ? `${pending.storeName} - レシート`
-        : 'レシート';
-      
-      await this.addExpense(replyToken, userId, jpyAmount, description);
-    } else {
-      await this.replyMessage(replyToken, '❌ 支出の記録をキャンセルしました。');
-    }
+  public async handleConfirmation(replyToken: string, userId: string, confirmed: boolean): Promise<void> {
+    await this.confirmationFlowService.handleConfirmationResponse(userId, replyToken, confirmed);
   }
 
-  private async handleReceiptEdit(replyToken: string, userId: string): Promise<void> {
+  public async handleReceiptEdit(replyToken: string, userId: string): Promise<void> {
     const pending = this.pendingTransactions.get(userId);
     
     if (!pending) {
@@ -2909,13 +2878,7 @@ export class BudgetBot {
       }
       
       // ワンタイムトークン生成（編集後の確認用）
-      this.cleanupExpiredTokens();
-      const token = this.generateDeleteToken();
-      this.expenseConfirmRequests.set(token, {
-        userId,
-        token,
-        timestamp: Date.now()
-      });
+      const token = await tokenManager.generateExpenseToken(userId);
 
       // 更新されたレシート確認カードを再送信
       const confirmationCard = this.createReceiptConfirmationCard(
@@ -2934,7 +2897,7 @@ export class BudgetBot {
     }
   }
 
-  private async handleMenuAction(replyToken: string, userId: string, action: string): Promise<void> {
+  public async handleMenuAction(replyToken: string, userId: string, action: string): Promise<void> {
     switch (action) {
       case 'menu_budget_status':
         await this.handleBudgetStatus(replyToken, userId);
@@ -2963,8 +2926,8 @@ export class BudgetBot {
         return;
       }
 
-      const statusEmoji = stats.budgetUsagePercentage > 100 ? '🚨' : 
-                         stats.budgetUsagePercentage > 80 ? '⚠️' : '✅';
+      const statusEmoji = stats.budgetUsagePercentage > BUDGET_DANGER_THRESHOLD ? '🚨' : 
+                         stats.budgetUsagePercentage > BUDGET_WARNING_THRESHOLD ? '⚠️' : '✅';
 
       const message = `${statusEmoji} 支出を記録しました\n\n` +
         `💸 支出: ${amount.toLocaleString()}円\n` +
@@ -2981,7 +2944,7 @@ export class BudgetBot {
     }
   }
 
-  private async handleTransactionEdit(replyToken: string, userId: string, transactionId: string): Promise<void> {
+  public async handleTransactionEdit(replyToken: string, userId: string, transactionId: string): Promise<void> {
     try {
       // ローディングアニメーションを表示
       await this.showLoadingAnimation(userId);
@@ -3011,16 +2974,13 @@ export class BudgetBot {
     }
   }
 
-  private async handleTransactionDelete(replyToken: string, userId: string, transactionId: string): Promise<void> {
+  public async handleTransactionDelete(replyToken: string, userId: string, transactionId: string): Promise<void> {
     try {
       // ローディングアニメーションを表示
       await this.showLoadingAnimation(userId);
       
-      // 期限切れトークンをクリーンアップ
-      this.cleanupExpiredTokens();
-      
       // 取引情報を取得して確認メッセージを表示
-      const transactions = await databaseService.getRecentTransactions(userId, 50);
+      const transactions = await databaseService.getRecentTransactions(userId, RECENT_TRANSACTIONS_LIMIT);
       const transactionIdNum = parseInt(transactionId);
       const transaction = transactions.find((t: Transaction) => t.id === transactionIdNum);
       
@@ -3030,16 +2990,7 @@ export class BudgetBot {
       }
 
       // ワンタイム・トークンを生成
-      const token = this.generateDeleteToken();
-      const deleteRequest: DeleteRequest = {
-        userId,
-        transactionId: transactionIdNum,
-        token,
-        timestamp: Date.now()
-      };
-      
-      // トークンを保存
-      this.deleteRequests.set(token, deleteRequest);
+      const token = tokenManager.generateDeleteToken(userId, transactionIdNum);
       console.log(`🔐 Delete token generated: ${token} for transaction ${transactionIdNum}`);
 
       const deleteCard = this.createTransactionDeleteCard(transaction, token);
@@ -3050,10 +3001,9 @@ export class BudgetBot {
     }
   }
 
-  private async handleDirectEditAmount(replyToken: string, userId: string, transactionId: number, newAmount: number): Promise<void> {
+  public async handleDirectEditAmount(replyToken: string, userId: string, transactionId: number, newAmount: number): Promise<void> {
     try {
       // 期限切れトークンをクリーンアップ
-      this.cleanupExpiredTokens();
       
       // レシート編集の場合（transactionId = -1）
       if (transactionId === -1) {
@@ -3071,17 +3021,7 @@ export class BudgetBot {
       }
 
       // ワンタイム・トークンを生成
-      const token = this.generateDeleteToken(); // 同じ生成ロジックを使用
-      const editRequest: EditRequest = {
-        userId,
-        transactionId,
-        newAmount,
-        token,
-        timestamp: Date.now()
-      };
-      
-      // トークンを保存
-      this.editRequests.set(token, editRequest);
+      const token = tokenManager.generateEditToken(userId, transactionId, newAmount);
       console.log(`🔐 Edit token generated: ${token} for transaction ${transactionId}`);
 
       // 編集確認カードを表示
@@ -3094,7 +3034,7 @@ export class BudgetBot {
   }
 
 
-  private async handleEditCommand(replyToken: string, userId: string, text: string): Promise<void> {
+  public async handleEditCommand(replyToken: string, userId: string, text: string): Promise<void> {
     try {
       // "edit transactionId newAmount" の形式をパース
       const parts = text.split(' ');
@@ -3135,13 +3075,12 @@ export class BudgetBot {
     }
   }
 
-  private async handleTransactionDeleteConfirm(replyToken: string, userId: string, token: string): Promise<void> {
+  public async handleTransactionDeleteConfirm(replyToken: string, userId: string, token: string): Promise<void> {
     try {
       // 期限切れトークンをクリーンアップ
-      this.cleanupExpiredTokens();
       
       // トークンの検証
-      const deleteRequest = this.deleteRequests.get(token);
+      const deleteRequest = tokenManager.getDeleteRequest(token);
       if (!deleteRequest) {
         await this.replyMessage(replyToken, '❌ 削除リクエストが無効または期限切れです。');
         console.log(`🔒 Invalid or expired delete token: ${token}`);
@@ -3153,12 +3092,12 @@ export class BudgetBot {
         await this.replyMessage(replyToken, '❌ 削除権限がありません。');
         console.log(`🚫 Unauthorized delete attempt: ${userId} != ${deleteRequest.userId}`);
         // 不正アクセス試行時はトークンを即座に削除
-        this.deleteRequests.delete(token);
+        tokenManager.removeDeleteRequest(token);
         return;
       }
 
       // トークンを失効（ワンタイム使用）
-      this.deleteRequests.delete(token);
+      tokenManager.removeDeleteRequest(token);
       console.log(`🔐 Delete token consumed: ${token}`);
 
       const result = await databaseService.deleteTransaction(userId, deleteRequest.transactionId);
@@ -3184,12 +3123,11 @@ export class BudgetBot {
     }
   }
 
-  private async handleDeleteCancel(replyToken: string, token: string): Promise<void> {
+  public async handleDeleteCancel(replyToken: string, token: string): Promise<void> {
     try {
       // トークンの検証とクリーンアップ
-      this.cleanupExpiredTokens();
       
-      const deleteRequest = this.deleteRequests.get(token);
+      const deleteRequest = tokenManager.getDeleteRequest(token);
       if (!deleteRequest) {
         await this.replyMessage(replyToken, '❌ キャンセルリクエストが無効または期限切れです。');
         console.log(`🔒 Invalid or expired cancel token: ${token}`);
@@ -3197,7 +3135,7 @@ export class BudgetBot {
       }
 
       // トークンを失効（キャンセル時も削除）
-      this.deleteRequests.delete(token);
+      tokenManager.removeDeleteRequest(token);
       console.log(`🔐 Cancel token consumed: ${token}`);
 
       await this.replyMessage(replyToken, '❌ 削除をキャンセルしました。');
@@ -3207,13 +3145,12 @@ export class BudgetBot {
     }
   }
 
-  private async handleEditConfirm(replyToken: string, userId: string, token: string): Promise<void> {
+  public async handleEditConfirm(replyToken: string, userId: string, token: string): Promise<void> {
     try {
       // 期限切れトークンをクリーンアップ
-      this.cleanupExpiredTokens();
       
       // トークンの検証
-      const editRequest = this.editRequests.get(token);
+      const editRequest = tokenManager.getEditRequest(token);
       if (!editRequest) {
         await this.replyMessage(replyToken, '❌ 編集リクエストが無効または期限切れです。');
         console.log(`🔒 Invalid or expired edit token: ${token}`);
@@ -3225,12 +3162,12 @@ export class BudgetBot {
         await this.replyMessage(replyToken, '❌ 編集権限がありません。');
         console.log(`🚫 Unauthorized edit attempt: ${userId} != ${editRequest.userId}`);
         // 不正アクセス試行時はトークンを即座に削除
-        this.editRequests.delete(token);
+        tokenManager.removeEditRequest(token);
         return;
       }
 
       // トークンを失効（ワンタイム使用）
-      this.editRequests.delete(token);
+      tokenManager.removeEditRequest(token);
       console.log(`🔐 Edit token consumed: ${token}`);
 
       const result = await databaseService.editTransaction(userId, editRequest.transactionId, editRequest.newAmount);
@@ -3256,12 +3193,11 @@ export class BudgetBot {
     }
   }
 
-  private async handleEditCancel(replyToken: string, token: string): Promise<void> {
+  public async handleEditCancel(replyToken: string, token: string): Promise<void> {
     try {
       // トークンの検証とクリーンアップ
-      this.cleanupExpiredTokens();
       
-      const editRequest = this.editRequests.get(token);
+      const editRequest = tokenManager.getEditRequest(token);
       if (!editRequest) {
         await this.replyMessage(replyToken, '❌ キャンセルリクエストが無効または期限切れです。');
         console.log(`🔒 Invalid or expired edit cancel token: ${token}`);
@@ -3269,7 +3205,7 @@ export class BudgetBot {
       }
 
       // トークンを失効（キャンセル時も削除）
-      this.editRequests.delete(token);
+      tokenManager.removeEditRequest(token);
       console.log(`🔐 Edit cancel token consumed: ${token}`);
 
       await this.replyMessage(replyToken, '❌ 編集をキャンセルしました。');
@@ -3279,11 +3215,10 @@ export class BudgetBot {
     }
   }
 
-  private async handleExpenseConfirm(replyToken: string, userId: string, token: string): Promise<void> {
+  public async handleExpenseConfirm(replyToken: string, userId: string, token: string): Promise<void> {
     try {
-      this.cleanupExpiredTokens();
       
-      const expenseRequest = this.expenseConfirmRequests.get(token);
+      const expenseRequest = tokenManager.getExpenseConfirmRequest(token);
       if (!expenseRequest || expenseRequest.userId !== userId) {
         await this.replyMessage(replyToken, '❌ 確認リクエストが無効または期限切れです。');
         console.log(`🔒 Invalid or expired expense confirm token: ${token}`);
@@ -3291,7 +3226,7 @@ export class BudgetBot {
       }
 
       // トークンを失効（ワンタイム使用）
-      this.expenseConfirmRequests.delete(token);
+      tokenManager.removeExpenseConfirmRequest(token);
       console.log(`🔐 Expense confirm token consumed: ${token}`);
 
       // 旧来のconfirmation処理を呼び出し
@@ -3302,11 +3237,10 @@ export class BudgetBot {
     }
   }
 
-  private async handleExpenseCancel(replyToken: string, token: string): Promise<void> {
+  public async handleExpenseCancel(replyToken: string, token: string): Promise<void> {
     try {
-      this.cleanupExpiredTokens();
       
-      const expenseRequest = this.expenseConfirmRequests.get(token);
+      const expenseRequest = tokenManager.getExpenseConfirmRequest(token);
       if (!expenseRequest) {
         await this.replyMessage(replyToken, '❌ キャンセルリクエストが無効または期限切れです。');
         console.log(`🔒 Invalid or expired expense cancel token: ${token}`);
@@ -3314,7 +3248,7 @@ export class BudgetBot {
       }
 
       // トークンを失効
-      this.expenseConfirmRequests.delete(token);
+      tokenManager.removeExpenseConfirmRequest(token);
       console.log(`🔐 Expense cancel token consumed: ${token}`);
 
       // 旧来のconfirmation処理を呼び出し
@@ -3325,11 +3259,10 @@ export class BudgetBot {
     }
   }
 
-  private async handleResetConfirm(replyToken: string, userId: string, token: string): Promise<void> {
+  public async handleResetConfirm(replyToken: string, userId: string, token: string): Promise<void> {
     try {
-      this.cleanupExpiredTokens();
       
-      const resetRequest = this.resetConfirmRequests.get(token);
+      const resetRequest = tokenManager.getResetRequest(token);
       if (!resetRequest || resetRequest.userId !== userId) {
         await this.replyMessage(replyToken, '❌ リセット確認が無効または期限切れです。');
         console.log(`🔒 Invalid or expired reset confirm token: ${token}`);
@@ -3337,7 +3270,7 @@ export class BudgetBot {
       }
 
       // トークンを失効（ワンタイム使用）
-      this.resetConfirmRequests.delete(token);
+      tokenManager.removeResetRequest(token);
       console.log(`🔐 Reset confirm token consumed: ${token}`);
 
       // 旧来のreset confirmation処理を呼び出し
@@ -3348,11 +3281,10 @@ export class BudgetBot {
     }
   }
 
-  private async handleResetCancel(replyToken: string, token: string): Promise<void> {
+  public async handleResetCancel(replyToken: string, token: string): Promise<void> {
     try {
-      this.cleanupExpiredTokens();
       
-      const resetRequest = this.resetConfirmRequests.get(token);
+      const resetRequest = tokenManager.getResetRequest(token);
       if (!resetRequest) {
         await this.replyMessage(replyToken, '❌ キャンセルリクエストが無効または期限切れです。');
         console.log(`🔒 Invalid or expired reset cancel token: ${token}`);
@@ -3360,7 +3292,7 @@ export class BudgetBot {
       }
 
       // トークンを失効
-      this.resetConfirmRequests.delete(token);
+      tokenManager.removeResetRequest(token);
       console.log(`🔐 Reset cancel token consumed: ${token}`);
 
       // 旧来のreset confirmation処理を呼び出し
@@ -3371,41 +3303,15 @@ export class BudgetBot {
     }
   }
 
-  private async handleManualExpenseConfirmation(replyToken: string, userId: string, amount: number, description: string): Promise<void> {
+  public async handleManualExpenseConfirmation(replyToken: string, userId: string, amount: number, description: string): Promise<void> {
     try {
-      // ワンタイムトークン生成
-      this.cleanupExpiredTokens();
-      const token = this.generateDeleteToken();
-      this.expenseConfirmRequests.set(token, {
+      // 新しい確認フローサービスを使用
+      await this.confirmationFlowService.createAndSendManualConfirmation(
         userId,
-        token,
-        timestamp: Date.now()
-      });
-
-      // 保留中取引として保存
-      this.pendingTransactions.set(userId, {
-        userId,
-        parsedAmounts: [{
-          amount,
-          currency: { code: 'JPY', symbol: '¥', name: '日本円' },
-          originalText: description,
-          convertedAmount: amount
-        }],
-        storeName: null,
-        timestamp: Date.now()
-      });
-
-      // 確認画面を送信
-      const confirmationCard = this.createReceiptConfirmationCard(
+        replyToken,
         amount,
-        undefined,
-        undefined,
-        undefined,
-        description,
-        token
+        description
       );
-
-      await this.replyFlexMessage(replyToken, '💰 支出確認', confirmationCard);
     } catch (error) {
       console.error('Manual expense confirmation error:', error);
       await this.replyMessage(replyToken, '❌ 支出確認の準備中にエラーが発生しました。');
