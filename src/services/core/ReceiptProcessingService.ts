@@ -36,6 +36,36 @@ export class ReceiptProcessingService {
     return Buffer.concat(chunks);
   }
 
+  // テキストからレシート解析（v2アーキテクチャ用）
+  async parseReceipt(text: string): Promise<{
+    success: boolean;
+    amounts: ParsedAmount[];
+    storeName: string | null;
+  }> {
+    try {
+      console.log('🔍 Parsing receipt text with advanced parser...');
+      
+      // 高度な解析を実行
+      const analysisResult = advancedReceiptParser.parseReceipt(text);
+      
+      // 結果を最適化
+      const optimizedResult = this.optimizeResults(analysisResult);
+      
+      return {
+        success: true,
+        amounts: optimizedResult.amounts,
+        storeName: optimizedResult.storeName
+      };
+    } catch (error) {
+      console.error('Receipt parsing failed:', error);
+      return {
+        success: false,
+        amounts: [],
+        storeName: null
+      };
+    }
+  }
+
   // OCRを使用してレシート処理
   async processReceiptWithOCR(
     imageBuffer: Buffer, 

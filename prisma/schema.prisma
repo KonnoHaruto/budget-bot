@@ -17,6 +17,7 @@ model User {
   id            String        @id @default(cuid())
   lineUserId    String        @unique @map("line_user_id")
   monthlyBudget Float         @default(0) @map("monthly_budget")
+  currency      String        @default("JPY")
   currentSpent  Float         @default(0) @map("current_spent")
   createdAt     DateTime      @default(now()) @map("created_at")
   updatedAt     DateTime      @updatedAt @map("updated_at")
@@ -30,9 +31,11 @@ model Transaction {
   id          Int      @id @default(autoincrement())
   userId      String   @map("user_id")
   amount      Float
+  currency    String   @default("JPY")
   description String?
   imageUrl    String?  @map("image_url")
   createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @default(now()) @updatedAt @map("updated_at")
   
   user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
   
