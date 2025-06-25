@@ -18,7 +18,7 @@ export interface ExchangeRateResponse {
   date: string;
 }
 
-import { exchangeRateUpdateService } from './exchangeRateUpdateService';
+// exchangeRateUpdateService は別ファイルで管理
 
 export class CurrencyService {
   private static readonly CURRENCIES: CurrencyInfo[] = [
@@ -104,7 +104,8 @@ export class CurrencyService {
     
     try {
       // キャッシュされたレートを取得
-      const cachedRate = await exchangeRateUpdateService.getCachedExchangeRate(fromCurrency, toCurrency);
+      // キャッシュされた為替レートの取得は実装から除外
+      const cachedRate = null;
       
       if (cachedRate !== null) {
         return cachedRate;
